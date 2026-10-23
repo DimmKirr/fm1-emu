@@ -196,6 +196,13 @@ some units, to test a firmware's fallback to one core ([docs/stock-firmware.md](
 `fm1-live --flash FILE` keeps the flash chip (saved presets, samples) in FILE between runs: read
 at the start if it is there, written back at the end. `FM1_FLASH_CUT=N` cuts the power half way
 through the Nth erase or page program, to see what a firmware makes of a half-written save.
+`fm1-live --usb` plugs in a USB cable: the FM-1's USB controller answers (without it, it stays
+silent, as on a unit with no cable), a host enumerates it, and a USB-MIDI firmware shows up on the
+computer as a MIDI device "<its product name> (emu)" that any program can play or talk to, Felucca's
+`fm1_install.py` included. It goes away when the firmware drops off USB. Headless, `--shot` with
+`FM1_USB_SEND='MS:HEX;…'` sends MIDI over USB at those times and prints what comes back
+(`FM1_USB_TRACE`: the bus's transactions; `FM1_USB_SIE_NS`: the controller's register access time,
+an estimate, 1 µs by default).
 
 The page builds with `web/build.sh` (Rust to WebAssembly; needs the `wasm32-unknown-unknown`
 target), the whole site with `tools/build_site.sh`.

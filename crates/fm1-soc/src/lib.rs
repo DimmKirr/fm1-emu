@@ -35,6 +35,7 @@ pub mod periph;
 mod ram;
 pub mod smk;
 mod spiflash;
+pub mod usb;
 
 pub use lcd::{write_bmp, Lcd};
 pub use periph::{Action, Periph, CPU_HZ, VEC_BASE};
@@ -234,6 +235,8 @@ pub struct Soc {
     pub flaky_core1: Option<flaky::FlakyCore1>,
     /// The power domain's analog registers.
     pub p33: p33::P33,
+    /// USB0 and, with a cable (`usb_plug`), a host on the other end (usb.rs).
+    pub usb: usb::Usb,
     /// Exact skipping of cpu0's polling loops (`machine::run_blocks`).
     pub loop_skip: machine::LoopSkip,
 }
@@ -370,6 +373,7 @@ impl Soc {
             unknown_log: Vec::new(),
             flaky_core1: None,
             p33: Default::default(),
+            usb: Default::default(),
             // (FM1_TRACE: a trace shows every instruction as it runs, not a probe's)
             loop_skip: machine::LoopSkip::new(std::env::var_os("FM1_NO_LOOPSKIP").is_none() && std::env::var_os("FM1_TRACE").is_none()),
         }
@@ -382,7 +386,8 @@ impl Soc {
         let fm1 = self.board == Board::Fm1;
         match self.region(addr) {
             Region::Xip | Region::XipFlash | Region::Ram | Region::Ovl | Region::Sram2 => true,
-            Region::Irqc | Region::Iomap | Region::Usb | Region::Clk | Region::Ana | Region::Bt | Region::Dbg => true,
+            Region::Usb => self.usb.pure(addr),
+            Region::Irqc | Region::Iomap | Region::Clk | Region::Ana | Region::Bt | Region::Dbg => true,
             Region::Spi2 | Region::Crc | Region::P33 | Region::Alnk | Region::Uart1 | Region::Sfcenc => true,
             // the tick counter's word counts the clock
             Region::Irqc2 => addr != 0x1eef0f0,
@@ -448,6 +453,12 @@ impl Soc {
         if let Some((at, b)) = due.uart_rx {
             self.write8(at, b);
         }
+        if due.usb_frame {
+            let pullup = self.sfr_get(usb::USB_IO_CON0) & 0x40 != 0;
+            let mut u = std::mem::take(&mut self.usb);
+            u.frame(self, pullup);
+            self.usb = u;
+        }
         if let Some((adr, words)) = due.audio_half {
             if self.audio_trace {
                 eprintln!("half {} ms {}", self.periph.ms(), self.periph.cycles);
@@ -457,6 +468,14 @@ impl Soc {
                 self.periph.audio.push((w >> 8).clamp(-32768, 32767) as i16);
             }
         }
+    }
+
+    /// A USB cable to a host (usb.rs): the SIE answers, and a frame every millisecond.
+    pub fn usb_plug(&mut self) {
+        self.usb.plug(self.periph.hz);
+        self.periph.usb_period = (self.periph.hz / 1000).max(1);
+        self.periph.usb_next = self.periph.cycles + self.periph.usb_period;
+        self.periph.next_due = 0;
     }
 
     /// The highest-priority enabled pending interrupt: (irq, prio).
@@ -812,6 +831,7 @@ impl Soc {
                     _ => v,
                 }
             }
+            Region::Usb if (usb::USB_LO..=usb::USB_HI).contains(&addr) => self.usb.read(addr, self.periph.cycles),
             // (the second USB PHY ready: bit 4 of its control word, once it is powered up)
             Region::Usb if addr == 0x16800 => self.sfr_get(addr) | 0x10,
             Region::Iomap | Region::Usb | Region::Clk => self.sfr_get(addr),
@@ -971,6 +991,7 @@ impl Soc {
                 }
                 self.sfr_set(addr, value)
             }
+            Region::Usb if (usb::USB_LO..=usb::USB_HI).contains(&addr) => self.usb.write(addr, value, self.periph.cycles),
             Region::Usb => {
                 if addr == 0x16a0c && self.board == Board::Smk37 {
                     self.periph.smk.commons = value;
@@ -1256,5 +1277,14 @@ mod tests {
         assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the erase after the cut never happened");
         assert_eq!(soc.flash.ops, 3);
         assert!(soc.flash.cut());
+    }
+}
+
+impl usb::Dma for Soc {
+    fn dma_read8(&mut self, addr: u32) -> u8 {
+        self.read8(addr)
+    }
+    fn dma_write8(&mut self, addr: u32, v: u8) {
+        self.write8(addr, v)
     }
 }
