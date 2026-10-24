@@ -15,7 +15,7 @@
   "audio": "9182b169bb451e93"
  },
  "beetle": {
-  "package": "0d5aea5d0f76bff1",
+  "package": "2495f3b9a265c199",
   "bytes": 1371648,
   "audio": "0e6a0ae8d3d6b0e8"
  },
@@ -30,9 +30,9 @@
   "audio": "574af33190fc0f85"
  },
  "chipbox": {
-  "package": "8920c0c75826c4e7",
+  "package": "0a6df3248c07b175",
   "bytes": 1378304,
-  "audio": "9c0a2aa6f52cae41"
+  "audio": "50b68414f0c95904"
  },
  "choralroot": {
   "package": "7fec6a729c2d05d1",
@@ -45,14 +45,14 @@
   "audio": "ac1b2959f9e39b63"
  },
  "coralflower": {
-  "package": "d91fb954d25832db",
-  "bytes": 1376256,
-  "audio": "b7d6770ab5349912"
+  "package": "ab7d0744eed0c83d",
+  "bytes": 1374720,
+  "audio": "6909b985d198e9b7"
  },
  "cs1": {
-  "package": "abde7ad1503e39c9",
+  "package": "25179bef57f6136a",
   "bytes": 1377280,
-  "audio": "e1d570e2d19303ce"
+  "audio": "b9b0637023abc424"
  },
  "ctl": {
   "package": "fd9df8eac1d37a1b",
@@ -65,19 +65,19 @@
   "audio": "87a5094a108b6a45"
  },
  "dinghy": {
-  "package": "4e907044a7bda340",
+  "package": "5e7dc80d186528cf",
   "bytes": 1378304,
-  "audio": "514ba5b3d1a63166"
+  "audio": "ff083ea4eabd6dbe"
  },
  "dub": {
-  "package": "1816e6eea0c2f8aa",
+  "package": "35a464983c8b0f11",
   "bytes": 1386496,
-  "audio": "1a41ea82284bc232"
+  "audio": "d313eb345e476e4b"
  },
  "duell": {
-  "package": "bdb12cf2b476124b",
-  "bytes": 1385472,
-  "audio": "7fe32c18c61e1f11"
+  "package": "f0fd3b46ec013feb",
+  "bytes": 1383936,
+  "audio": "c29f35156c39145e"
  },
  "emb": {
   "package": "4316a6e114912952",
@@ -85,9 +85,9 @@
   "audio": "c10e52d2810d1970"
  },
  "etch": {
-  "package": "cc50fc1fe8d793f6",
-  "bytes": 1284096,
-  "audio": "dc46df4faf2412b7"
+  "package": "f2cb183b3b5d4171",
+  "bytes": 1283584,
+  "audio": "389792500bbf9de3"
  },
  "fart": {
   "package": "b9e380061ddc086d",
@@ -145,9 +145,9 @@
   "audio": "b8baf0d819eee622"
  },
  "fomajam": {
-  "package": "d57f9764b019268b",
-  "bytes": 1379328,
-  "audio": "2008417c16b9cbb0"
+  "package": "a5071fffaa68e069",
+  "bytes": 1378304,
+  "audio": "4891e687e1d44478"
  },
  "fomni": {
   "package": "71fa8304b91bff89",
@@ -160,7 +160,7 @@
   "audio": "ee008505504f31c4"
  },
  "fumi": {
-  "package": "817845fb4a6f6f23",
+  "package": "211db1c2efc379b0",
   "bytes": 1387520,
   "audio": "558ab55b991f2e59"
  },
@@ -185,12 +185,12 @@
   "audio": "c1863c96adc91f86"
  },
  "hortator": {
-  "package": "8f09f76083cf07ef",
-  "bytes": 1384448,
-  "audio": "2aca750ad338258a"
+  "package": "c3f17a2823329646",
+  "bytes": 1385472,
+  "audio": "584c9a804b659e30"
  },
  "hyp1": {
-  "package": "1d5e2c701fdf0b14",
+  "package": "2d310b243ea4f011",
   "bytes": 1383424,
   "audio": "ee5cf97ac484d666"
  },
@@ -200,9 +200,9 @@
   "audio": "4561042876d53a06"
  },
  "jiant": {
-  "package": "febe6e47eda8918c",
-  "bytes": 1385984,
-  "audio": "9bc7529bf550cf4e"
+  "package": "b1ea57059b722b1a",
+  "bytes": 1385472,
+  "audio": "7a4a7203028ce7d9"
  },
  "kawa": {
   "package": "6a990a08bf3861a6",
@@ -235,7 +235,7 @@
   "audio": "369347f62a3f6671"
  },
  "minitone": {
-  "package": "47b5cba9e5e1c8f6",
+  "package": "41ed3ac6287c3452",
   "bytes": 1386496,
   "audio": "806f4282e323a1ca"
  },
@@ -285,7 +285,7 @@
   "audio": "1e2410496188f9b8"
  },
  "pigeon": {
-  "package": "ab4c2268cbeaaff6",
+  "package": "a6cbb4fbd80baa38",
   "bytes": 1374720,
   "audio": "db10eeb47957131e"
  },
@@ -310,9 +310,9 @@
   "audio": "e09ad922eb39ec45"
  },
  "shineon": {
-  "package": "ce5c3bdbd367013a",
+  "package": "72070fba5d9c27b6",
   "bytes": 1378304,
-  "audio": "aa42e2bb403e53eb"
+  "audio": "f3e5456ffd709998"
  },
  "sid": {
   "package": "f4a07dce2d5fa9d0",
@@ -355,14 +355,14 @@
   "audio": "34eb5c75ab425e2e"
  },
  "tonitor": {
-  "package": "4eb641de9badd71c",
-  "bytes": 272384,
-  "audio": "7834ec36e40916d2"
+  "package": "20e85fbd0a7361fd",
+  "bytes": 267264,
+  "audio": "c30db4e959cba2d2"
  },
  "tribe": {
-  "package": "979e88660140b1c2",
-  "bytes": 1382400,
-  "audio": "45599aceb9b7e2d3"
+  "package": "daa953ea5c37a561",
+  "bytes": 1378304,
+  "audio": "cea019e9377d00a3"
  },
  "tuna": {
   "package": "d94c2fcf5257f771",
@@ -375,9 +375,9 @@
   "audio": "0862d83c6e2cea70"
  },
  "vector37": {
-  "package": "b6404f716c303e76",
+  "package": "4c9ff3c9ca0b874d",
   "bytes": 1377280,
-  "audio": "5b698fb51a398e1f"
+  "audio": "6343f3cb6dab13bb"
  },
  "waveloop": {
   "package": "e9529deb7ff626ee",
@@ -400,7 +400,7 @@
   "audio": "0dc04d70e8fbe09d"
  },
  "zen": {
-  "package": "bc8118b5ce9fce71",
+  "package": "e3c51c045b1a763b",
   "bytes": 1385472,
   "audio": "8c8601a36aa449f7"
  },
