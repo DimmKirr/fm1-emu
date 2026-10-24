@@ -1317,8 +1317,8 @@ impl Cpu {
     /// `icfg` as read: low byte, the ISR priorities in progress (`icfg & 0xff` is the RTOS's
     /// "in interrupt context" test); bit 9, the global enable `sti` / `cli` set and clear (the
     /// SDK's cpu_irq_disabled() is `(icfg & 0x300) != 0x300`, bit 8 being the software master
-    /// enable; the stock RTOS asserted in os_mutex_pend while bit 9 read 0). Writes keep their own
-    /// bit 9 out of it.
+    /// enable; the stock RTOS asserted in os_mutex_pend while bit 9 read 0). A write sets the
+    /// global enable from its bit 9 (`set_icfg`).
     #[inline]
     fn icfg(&self) -> u32 {
         let active = self.irq_levels.iter().fold(0u32, |m, &p| m | 1 << p);
@@ -1335,9 +1335,20 @@ impl Cpu {
             self.sreg_store[Self::sreg_index(n)]
         }
     }
+    /// `icfg = R`: bit 9 is the global enable, as it reads. Felucca's guard is `f = icfg; cli;
+    /// ...; icfg = f`, so the write must turn interrupts back on (inside an ISR, Rainbow's beat
+    /// left them off for good and the firmware stopped).
+    #[inline]
+    fn set_icfg(&mut self, v: u32) {
+        self.sreg_store[0] = v;
+        self.ie = v & 0x200 != 0;
+    }
     fn set_sreg(&mut self, n: &str, v: u32) {
         if n == "psr" {
             self.flags = v & 0xf;
+        }
+        if n == "icfg" {
+            return self.set_icfg(v);
         }
         self.sreg_store[Self::sreg_index(n)] = v;
     }
@@ -1609,7 +1620,7 @@ impl Cpu {
             }
             Fast::IcfgRd { d } => self.regs[(d & 15) as usize] = self.icfg(),
             Fast::IcfgWr { s } => {
-                self.sreg_store[0] = self.regs[(s & 15) as usize];
+                self.set_icfg(self.regs[(s & 15) as usize]);
                 bus.irq_window();
             }
             Fast::BlockMove { base, mask, store, post, down } => {
@@ -4581,6 +4592,34 @@ mod tests {
         }
         assert_eq!(cpu.regs[2], 0x0201_2345, "r2 = reti");
         assert_eq!(cpu.rets, 0x0200_0abc, "rets = r1");
+    }
+
+    /// Felucca's interrupt guard (motion.c): `r1 = icfg; cli; icfg = r1` puts the global enable
+    /// back, stepped, interpreted and compiled; a value with bit 9 clear turns it off.
+    #[test]
+    fn icfg_restores_the_global_enable() {
+        // `64 e0 00 1b` r1 = icfg, `60 00` cli, `64 e0 80 1b` icfg = r1 (Rainbow Mode 1.1.5)
+        let code = [0x64u8, 0xe0, 0x00, 0x1b, 0x60, 0x00, 0x64, 0xe0, 0x80, 0x1b];
+        for how in ["step", "interpreted", "jit"] {
+            for on in [true, false] {
+                let mut mem = vec![0u8; 0x100];
+                mem[..code.len()].copy_from_slice(&code);
+                let mut ram = FlatRam::new(mem);
+                let mut cpu = Cpu::new(0);
+                cpu.ie = on;
+                cpu.jit_on = how == "jit";
+                if how == "step" {
+                    for _ in 0..3 { cpu.step(&mut ram).unwrap(); }
+                } else {
+                    let mut n = 0;
+                    while n < 3 {
+                        n += match cpu.run_fast(&mut ram, 3 - n).unwrap() { (0, _) => { cpu.step(&mut ram).unwrap(); 1 } (k, _) => k };
+                    }
+                }
+                assert_eq!(cpu.pc, code.len() as u32, "{how}");
+                assert_eq!(cpu.ie, on, "{how}: ie {on} after the guard");
+            }
+        }
     }
 
     #[test]
