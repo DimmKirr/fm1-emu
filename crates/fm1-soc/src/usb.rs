@@ -29,6 +29,10 @@
 //! (`midi_take`). The device only answers at its own address (FADDR), so a firmware that gets
 //! SET_ADDRESS wrong drops off as it would on a real bus.
 //!
+//! Not modelled: the USB interrupt. The SIE sets its flags (INTRTX / INTRRX / INTRUSB) but
+//! raises no IRQ line, so a driver that polls them (Felucca's usb.c) enumerates, and one that
+//! waits for the interrupt (M-VAVE's own firmware) does not.
+//!
 //! SPDX-License-Identifier: GPL-3.0-only
 
 use std::collections::VecDeque;
@@ -722,6 +726,10 @@ impl Usb {
                 Step::Conf
             }
             Step::Conf => {
+                // (wTotalLength is the device's word: under 9, or another type, is not one)
+                if got.len() < 9 || got[1] != 2 {
+                    return self.fail(format!("configuration descriptor: {got:02x?}"));
+                }
                 self.conf = got;
                 if self.dev_desc[15] == 0 {
                     Step::SetConfig
@@ -871,5 +879,163 @@ mod tests {
             }
         }
         assert_eq!(out, msgs);
+    }
+
+    /// RAM for the endpoints' DMA.
+    struct Ram(Vec<u8>);
+    impl Dma for Ram {
+        fn dma_read8(&mut self, addr: u32) -> u8 {
+            self.0[addr as usize & 0xfff]
+        }
+        fn dma_write8(&mut self, addr: u32, v: u8) {
+            self.0[addr as usize & 0xfff] = v;
+        }
+    }
+
+    const EP0_BUF: u32 = 0x100;
+    const EP1_TX: u32 = 0x200;
+    const EP1_RX: u32 = 0x300;
+
+    /// A USB-MIDI device's firmware that polls the SIE, as Felucca's usb.c does: EP0's
+    /// requests from a descriptor table, then MIDI on EP1 both ways.
+    struct Fw {
+        t: u64,
+        conf: Vec<u8>,
+        addr: Option<u8>,
+        got: Vec<u8>,
+    }
+    impl Fw {
+        fn new(conf: Vec<u8>) -> Self {
+            Fw { t: 0, conf, addr: None, got: Vec::new() }
+        }
+        fn w(&mut self, u: &mut Usb, r: u32, v: u8) {
+            u.write(USB_LO + 4, r << 8 | v as u32, self.t);
+            self.t += 10;
+        }
+        fn r(&mut self, u: &mut Usb, r: u32) -> u8 {
+            u.write(USB_LO + 4, r << 8 | 0x4000, self.t);
+            self.t += 10;
+            let v = u.read(USB_LO + 4, self.t);
+            assert!(v & 0x8000 != 0, "the SIE answers");
+            v as u8
+        }
+        fn desc(&self, wv: u16) -> Vec<u8> {
+            match wv {
+                0x0100 => vec![18, 1, 0x10, 1, 0, 0, 0, 64, 0x34, 0x12, 0x78, 0x56, 0, 1, 0, 2, 0, 1],
+                0x0200 => self.conf.clone(),
+                0x0300 => vec![4, 3, 0x09, 0x04],
+                0x0302 => vec![10, 3, b'T', 0, b'e', 0, b's', 0, b't', 0],
+                _ => Vec::new(),
+            }
+        }
+        /// After each frame: what the main loop does.
+        fn poll(&mut self, u: &mut Usb, ram: &mut Ram) {
+            let tx = self.r(u, S_INTRTX1);
+            if tx & 1 != 0 {
+                self.w(u, S_INDEX, 0);
+                let csr = self.r(u, S_CSR0);
+                if csr & 1 == 0 {
+                    if let Some(a) = self.addr.take() {
+                        self.w(u, S_FADDR, a); // after SET_ADDRESS's status stage
+                    }
+                } else {
+                    let s: Vec<u8> = (0..8).map(|i| ram.dma_read8(EP0_BUF + i)).collect();
+                    let (wv, wl) = (u16::from_le_bytes([s[2], s[3]]), u16::from_le_bytes([s[6], s[7]]) as usize);
+                    match (s[0], s[1]) {
+                        (0x80, 6) => {
+                            let d = self.desc(wv);
+                            let n = d.len().min(wl);
+                            for (i, &b) in d[..n].iter().enumerate() {
+                                ram.dma_write8(EP0_BUF + i as u32, b);
+                            }
+                            u.write(USB_LO + 8, n as u32, self.t);
+                            self.w(u, S_CSR0, 0x40 | 0x08 | 0x02);
+                        }
+                        (0, 5) => {
+                            self.addr = Some(s[2]);
+                            self.w(u, S_CSR0, 0x40 | 0x08);
+                        }
+                        _ => self.w(u, S_CSR0, 0x40 | 0x08),
+                    }
+                }
+            }
+            if self.r(u, S_INTRRX1) & 2 != 0 {
+                self.w(u, S_INDEX, 1);
+                let n = self.r(u, S_COUNT0) as u32;
+                self.got.extend((0..n).map(|i| ram.dma_read8(EP1_RX + i)));
+                self.w(u, S_RXCSR1, 0);
+            }
+        }
+        /// One USB-MIDI packet to the computer on EP1.
+        fn send(&mut self, u: &mut Usb, ram: &mut Ram, p: [u8; 4]) {
+            for (i, &b) in p.iter().enumerate() {
+                ram.dma_write8(EP1_TX + i as u32, b);
+            }
+            u.write(USB_LO + 0xc, 4, self.t);
+            self.w(u, S_INDEX, 1);
+            self.w(u, S_CSR0, 1);
+        }
+    }
+
+    /// A configuration with a MIDI streaming interface, bulk OUT 1 and IN 0x81.
+    fn midi_conf(total: u16) -> Vec<u8> {
+        let mut c = vec![9, 2, total as u8, (total >> 8) as u8, 2, 1, 0, 0x80, 50];
+        c.extend([9, 4, 0, 0, 0, 1, 1, 0, 0]);
+        c.extend([9, 4, 1, 0, 2, 1, 3, 0, 0]);
+        c.extend([9, 5, 0x01, 2, 64, 0, 0, 0, 0]);
+        c.extend([9, 5, 0x81, 2, 64, 0, 0, 0, 0]);
+        c
+    }
+
+    fn device(conf: Vec<u8>) -> (Usb, Fw, Ram) {
+        let mut u = Usb { cable: true, sie_cycles: 1, ..Default::default() };
+        u.write(USB_LO, 1 | 4, 0); // on, the SIE out of reset, every endpoint's DMA on
+        u.write(USB_LO + 0x18, EP0_BUF, 0);
+        u.write(USB_LO + 0x1c, EP1_TX, 0);
+        u.write(USB_LO + 0x20, EP1_RX, 0);
+        (u, Fw::new(conf), Ram(vec![0; 0x1000]))
+    }
+
+    fn run(u: &mut Usb, fw: &mut Fw, ram: &mut Ram, frames: usize) {
+        for _ in 0..frames {
+            u.frame(ram, true);
+            fw.poll(u, ram);
+        }
+    }
+
+    /// Enumeration step by step (descriptors, SET_ADDRESS at its status stage, the product
+    /// string, SET_CONFIGURATION), then MIDI both ways.
+    #[test]
+    fn a_polling_device_enumerates_and_talks_midi() {
+        let (mut u, mut fw, mut ram) = device(midi_conf(45));
+        run(&mut u, &mut fw, &mut ram, 200);
+        assert_eq!(u.events, [UsbEvent::Configured { product: "Test".into(), vid: 0x1234, pid: 0x5678 }]);
+        assert_eq!(u.product(), Some("Test"));
+        assert_eq!(u.faddr, 9, "at the address the host gave");
+
+        u.midi_send(&[0x90, 60, 100]);
+        run(&mut u, &mut fw, &mut ram, 2);
+        assert_eq!(fw.got, [0x09, 0x90, 60, 100]);
+
+        fw.send(&mut u, &mut ram, [0x08, 0x80, 60, 0]);
+        run(&mut u, &mut fw, &mut ram, 2);
+        assert_eq!(u.midi_take(), [vec![0x80, 60, 0]]);
+
+        // the pull-up goes: off the bus
+        u.frame(&mut ram, false);
+        assert_eq!(u.events.last(), Some(&UsbEvent::Detached));
+        assert_eq!(u.product(), None);
+    }
+
+    /// A configuration whose wTotalLength is too short for one (or 0) fails the enumeration
+    /// instead of reading past it.
+    #[test]
+    fn a_short_configuration_fails_the_enumeration() {
+        for total in [0u16, 4, 8] {
+            let (mut u, mut fw, mut ram) = device(midi_conf(total));
+            run(&mut u, &mut fw, &mut ram, 200);
+            assert!(matches!(u.events.as_slice(), [UsbEvent::Failed(_)]), "wTotalLength {total}: {:?}", u.events);
+            assert_eq!(u.product(), None);
+        }
     }
 }
