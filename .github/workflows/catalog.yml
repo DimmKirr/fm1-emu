@@ -1,0 +1,77 @@
+# Every catalog firmware played with the JIT and interpreted (tools/catalog_check.py): the two
+# give the same audio, and the audio is the one in tests/catalog.json. Runs when the emulator
+# changes, and before a release (release.yml). A change that moves a firmware's sound updates
+# tests/catalog.json in the same pull request (tools/catalog_check.py --update).
+
+name: Catalog
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - crates/fm1-isa/**
+      - crates/fm1-core/**
+      - crates/fm1-soc/**
+      - crates/fm1-live/**
+      - Cargo.lock
+      - web/firmwares.json
+      - web/fwsc.js
+      - tests/catalog.json
+      - tools/catalog_check.py
+      - tools/fetch_firmwares.mjs
+      - .github/workflows/catalog.yml
+  pull_request:
+    paths:
+      - crates/fm1-isa/**
+      - crates/fm1-core/**
+      - crates/fm1-soc/**
+      - crates/fm1-live/**
+      - Cargo.lock
+      - web/firmwares.json
+      - web/fwsc.js
+      - tests/catalog.json
+      - tools/catalog_check.py
+      - tools/fetch_firmwares.mjs
+      - .github/workflows/catalog.yml
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  catalog:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Rust and ALSA headers
+        run: |
+          command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev pkg-config
+
+      # The packages from their authors' sites, as the page fetches them; kept between runs so a
+      # site that is down skips one firmware at most (the check reports it).
+      - uses: actions/cache@v4
+        with:
+          path: reference/firmwares
+          key: firmwares-${{ hashFiles('web/firmwares.json') }}
+          restore-keys: firmwares-
+
+      - name: Fetch the firmwares
+        run: node tools/fetch_firmwares.mjs
+
+      - name: Build fm1-live
+        run: cargo build --release -p fm1-live
+
+      - name: Play the catalog
+        run: python3 tools/catalog_check.py --shard ${{ matrix.shard }}/4
