@@ -40,12 +40,10 @@ permissions:
   contents: read
 
 jobs:
-  catalog:
+  # The packages from their authors' sites, as the page fetches them, once for the four shards
+  # (a site asked 330 times at once refused some, and the page's fallback then took a newer build).
+  fetch:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
 
@@ -53,14 +51,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Rust and ALSA headers
-        run: |
-          command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libasound2-dev pkg-config
-
-      # The packages from their authors' sites, as the page fetches them; kept between runs so a
-      # site that is down skips one firmware at most (the check reports it).
+      # kept between runs: a site that is down costs nothing if its package was fetched before
       - uses: actions/cache@v4
         with:
           path: reference/firmwares
@@ -69,6 +60,35 @@ jobs:
 
       - name: Fetch the firmwares
         run: node tools/fetch_firmwares.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmwares
+          path: |
+            reference/firmwares/*.fwsc
+            reference/firmwares/*.xip.bin
+          retention-days: 1
+
+  catalog:
+    needs: fetch
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust and ALSA headers
+        run: |
+          command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev pkg-config
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: firmwares
+          path: reference/firmwares
 
       - name: Build fm1-live
         run: cargo build --release -p fm1-live
