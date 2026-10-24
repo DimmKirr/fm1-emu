@@ -215,6 +215,9 @@ pub struct Periph {
     /// the transfer under way finishes.
     pub spi2_pending: bool,
     spi2_next: u64,
+    /// USB frames (usb.rs): the next, and cycles per millisecond; MAX = no cable.
+    pub(crate) usb_next: u64,
+    pub(crate) usb_period: u64,
     tmr: [Tmr; 4],
     uart: Uart,
     /// The UART's interrupt condition (enabled and pending), kept for `any_pending`.
@@ -354,6 +357,8 @@ impl Default for Periph {
             adc_next: u64::MAX,
             spi2_pending: false,
             spi2_next: u64::MAX,
+            usb_next: u64::MAX,
+            usb_period: 0,
             tmr: [Tmr { next: u64::MAX, ..Default::default() }; 4],
             uart: Uart { next: u64::MAX, ot_next: u64::MAX, ..Default::default() },
             uart_irq: false,
@@ -392,6 +397,8 @@ pub struct Due {
     pub audio_half: Option<(u32, u32)>,
     /// A UART byte the RX DMA wrote: (address, byte).
     pub uart_rx: Option<(u32, u8)>,
+    /// A USB frame is due (the SoC runs the host's millisecond: usb.rs).
+    pub usb_frame: bool,
     pub actions: Vec<Action>,
 }
 
@@ -442,7 +449,7 @@ impl Periph {
     /// The next cycle at which something timed happens.
     fn next_event(&self) -> u64 {
         let mut n = self.t5_next.min(self.alnk_next).min(self.tick_next).min(self.spi2_next).min(self.adc_next).min(self.spi1_irq_at);
-        n = n.min(self.uart.next).min(self.uart.ot_next);
+        n = n.min(self.uart.next).min(self.uart.ot_next).min(self.usb_next);
         for t in &self.tmr {
             n = n.min(t.next);
         }
@@ -523,6 +530,13 @@ impl Periph {
         }
         if self.cycles >= self.uart.next {
             due.uart_rx = self.uart_receive();
+        }
+        if self.cycles >= self.usb_next {
+            due.usb_frame = true;
+            self.usb_next += self.usb_period;
+            if self.usb_next <= self.cycles {
+                self.usb_next = self.cycles + self.usb_period;
+            }
         }
         if self.cycles >= self.uart.ot_next {
             self.uart.ot_next = u64::MAX;

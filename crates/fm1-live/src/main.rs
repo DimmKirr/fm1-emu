@@ -22,6 +22,13 @@
 //! (`--midi none` turns that off, `--midi NAME` takes the inputs whose name contains NAME);
 //! `--midi-ch N` sends channel messages to channel N (M-VAVE's firmware listens on 2).
 //!
+//! USB (`--usb`): a cable to this computer (fm1_soc::usb): the emulated FM-1 enumerates, and a
+//! USB-MIDI firmware shows up here as a MIDI device named after it, "<product> (emu)", which
+//! any program can play and talk to (Felucca's tools/fm1_install.py, the web installer, a DAW).
+//! It goes when the firmware drops off USB (the update mode), as the real one does.
+//! Headless (`--shot`): FM1_USB_SEND='MS:HEX…;MS:HEX…' sends those MIDI messages over USB at
+//! those times, and what comes back is printed.
+//!
 //! `--flaky-core1 RATE [--seed N]`: core 1 misreads RAM now and then, as on some units
 //! (fm1_soc::flaky), for trying a firmware's fallback to one core.
 
@@ -72,6 +79,8 @@ struct Opts {
     /// --flash FILE: the flash chip's contents from FILE at the start (if it exists; after the
     /// package is installed), written back to it at the end (bench, shot, or the window closed)
     flash: Option<String>,
+    /// --usb: a USB cable to this computer (a host; USB-MIDI as a virtual MIDI device)
+    usb: bool,
 }
 
 /// The firmware catalog web/firmwares.json as (id, name, version, image path): each image is
@@ -98,9 +107,14 @@ fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
-                       flaky_core1: None, seed: None, flash: None };
+                       flaky_core1: None, seed: None, flash: None, usb: false };
     let mut i = 1;
     while i < a.len() {
+        if a[i] == "--usb" {
+            o.usb = true;
+            i += 1;
+            continue;
+        }
         match a[i].as_str() {
             "--bin" => {
                 o.bin = a.get(i + 1)?.clone();
@@ -200,6 +214,9 @@ impl Machine {
             }
             // (through the SFC as the loader leaves it, and again when the firmware sets its window)
             soc.restore_flash(&f);
+        }
+        if o.usb {
+            soc.usb_plug();
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -527,6 +544,7 @@ fn shot(o: &Opts, ms: u64) {
     let skip_from: u64 = std::env::var("FM1_SKIP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let want_skip = m.soc.periph.skip_idle;
     m.soc.periph.skip_idle = want_skip && skip_from == 0;
+    let mut usb_sends = usb_script();
     while m.soc.periph.ms() + 40 < ms {
         if want_skip && m.soc.periph.ms() >= skip_from {
             m.soc.periph.skip_idle = true;
@@ -534,6 +552,13 @@ fn shot(o: &Opts, ms: u64) {
         if let Err(e) = m.run(100_000) {
             return halted(&e);
         }
+        usb_headless(&mut m, &mut usb_sends);
+    }
+    if o.usb {
+        let u = &m.soc.usb;
+        println!("usb: {} SIE accesses ({:.1} ms of CPU at {} cycles each), {} packets out, {} in",
+                 u.sie_accesses, u.sie_accesses as f64 * u.sie_cycles as f64 * 1000.0 / m.soc.periph.hz as f64,
+                 u.sie_cycles, u.out_packets, u.in_packets);
     }
     println!("irq levels at the end: {:?}, ie {}, skipped {} cycles", m.cpu.irq_levels, m.cpu.ie, m.soc.periph.skipped);
     let _ = m.soc.periph.led_take();
@@ -590,6 +615,90 @@ fn shot(o: &Opts, ms: u64) {
         Err(e) => eprintln!("work/panel.ppm: {e}"),
     }
     save_flash(&m, o.flash.as_ref());
+}
+
+/// FM1_USB_SEND='MS:HEX…;MS:HEX…': MIDI messages to send over USB at those times (ms).
+fn usb_script() -> VecDeque<(u64, Vec<u8>)> {
+    let mut q: Vec<(u64, Vec<u8>)> = std::env::var("FM1_USB_SEND").unwrap_or_default().split(';').filter_map(|item| {
+        let (t, hex) = item.trim().split_once(':')?;
+        let hex: String = hex.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        let bytes = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()).collect::<Option<Vec<u8>>>()?;
+        Some((t.trim().parse().ok()?, bytes))
+    }).collect();
+    q.sort_by_key(|(t, _)| *t);
+    q.into()
+}
+
+/// --shot with --usb: the scripted MIDI out over USB, and what happened on the bus.
+fn usb_headless(m: &mut Machine, sends: &mut VecDeque<(u64, Vec<u8>)>) {
+    let now = m.soc.periph.ms();
+    while sends.front().is_some_and(|(t, _)| *t <= now) {
+        let (_, msg) = sends.pop_front().unwrap();
+        println!("[{now:6} ms] usb out: {}", hex(&msg));
+        m.soc.usb.midi_send(&msg);
+    }
+    for ev in m.soc.usb.events.drain(..) {
+        println!("[{now:6} ms] usb: {ev:?}");
+    }
+    for msg in m.soc.usb.midi_take() {
+        println!("[{now:6} ms] usb in:  {}", hex(&msg));
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// --usb, live: the device as a virtual MIDI device on this computer while it is on the bus.
+#[derive(Default)]
+struct UsbPorts {
+    out: Option<midir::MidiOutputConnection>,
+    _inp: Option<midir::MidiInputConnection<()>>,
+}
+
+impl UsbPorts {
+    /// The bus's news, MIDI both ways.
+    fn service(&mut self, m: &mut Machine, rx: &mpsc::Receiver<Vec<u8>>, tx: &mpsc::Sender<Vec<u8>>) {
+        while let Ok(msg) = rx.try_recv() {
+            m.soc.usb.midi_send(&msg);
+        }
+        for ev in m.soc.usb.events.drain(..) {
+            match ev {
+                fm1_soc::usb::UsbEvent::Configured { product, vid, pid } => {
+                    let name = format!("{product} (emu)");
+                    self.open(&name, tx);
+                    let ok = self.out.is_some() && self._inp.is_some();
+                    eprintln!("USB: \"{product}\" ({vid:04x}:{pid:04x}) on the bus{}", if ok { format!(", MIDI device \"{name}\"") } else { ", no MIDI device (virtual ports failed)".into() });
+                }
+                fm1_soc::usb::UsbEvent::Detached => {
+                    eprintln!("USB: the device left the bus");
+                    *self = UsbPorts::default();
+                }
+                fm1_soc::usb::UsbEvent::Failed(why) => eprintln!("USB: enumeration failed: {why}"),
+            }
+        }
+        for msg in m.soc.usb.midi_take() {
+            if let Some(out) = self.out.as_mut() {
+                let _ = out.send(&msg);
+            }
+        }
+    }
+}
+
+impl UsbPorts {
+    /// The virtual MIDI device (CoreMIDI, ALSA; Windows has none: the bus runs without one).
+    #[cfg(unix)]
+    fn open(&mut self, name: &str, tx: &mpsc::Sender<Vec<u8>>) {
+        use midir::os::unix::{VirtualInput, VirtualOutput};
+        self.out = midir::MidiOutput::new("fm1-live").ok().and_then(|o| o.create_virtual(name).ok());
+        self._inp = midir::MidiInput::new("fm1-live").ok().and_then(|mut i| {
+            i.ignore(midir::Ignore::None);
+            let tx = tx.clone();
+            i.create_virtual(name, move |_, msg, _| { let _ = tx.send(msg.to_vec()); }, ()).ok()
+        });
+    }
+    #[cfg(not(unix))]
+    fn open(&mut self, _name: &str, _tx: &mpsc::Sender<Vec<u8>>) {}
 }
 
 /// FM1_DUMPRAM=FILE: the RAM as the run left it.
@@ -712,7 +821,7 @@ const DRAG_PER_CLICK: f32 = 12.0;
 const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package: a community firmware, or M-VAVE's own)
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
-options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE]
+options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE] [--usb]
          [--flaky-core1 RATE [--seed N]] [--version] [--help]
 headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
           --shot MS    run MS ms, then write the panel to work/panel.ppm
@@ -727,7 +836,9 @@ env: FM1_BENCH_KEYS='T[-T2]:PLAY,T:n7,T:enc0:+3,T:pot:512,T:ms:mHEX'  scripted i
      FM1_KEY_AT, FM1_KEY_UP, FM1_NO_PLAY, FM1_NO_SKIP, FM1_SKIP_FROM, FM1_DUMP=ADDR  --shot
      FM1_NO_JIT            the interpreter (byte-identical, slower); FM1_NO_BLOCKS: a step at a time
      FM1_NO_LOOPSKIP       run polling loops round by round instead of skipping them (byte-identical, slower)
-     FM1_FLASH_CUT=N       cut the power half way through the Nth flash erase / program (--flash keeps what is left)";
+     FM1_FLASH_CUT=N       cut the power half way through the Nth flash erase / program (--flash keeps what is left)
+     FM1_USB_SEND='MS:HEX;…'  --shot --usb: MIDI messages over USB at those times; FM1_USB_TRACE: the bus
+     FM1_USB_SIE_NS=N      --usb: each SIE register access takes N ns (default 1000)";
 
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -787,6 +898,8 @@ fn main() {
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Action>();
     let _midi = midi_inputs(&o, &tx);
+    let (usb_tx, usb_rx) = mpsc::channel::<Vec<u8>>();
+    let usb_on = o.usb;
 
     let audio_ok = _stream.is_some();
     let emu = {
@@ -799,9 +912,13 @@ fn main() {
             let mut last_lcd = Instant::now();
             let mut last_stat = Instant::now();
             let (mut stat_emu, mut stat_wall) = (0u64, Instant::now());
+            let mut usb_ports = UsbPorts::default();
             while !quit.load(Ordering::Relaxed) {
                 while let Ok(a) = rx.try_recv() {
                     m.soc.periph.apply(&a);
+                }
+                if usb_on {
+                    usb_ports.service(&mut m, &usb_rx, &usb_tx);
                 }
                 let real = start.elapsed().as_secs_f64() * 1000.0 - offset_ms;
                 let emu_ms = m.soc.periph.cycles as f64 * 1000.0 / m.soc.periph.hz as f64;

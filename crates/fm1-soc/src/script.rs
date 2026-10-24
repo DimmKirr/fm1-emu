@@ -16,6 +16,14 @@ pub fn queue(soc: &mut Soc, keys: &str) {
                 }
                 continue;
             }
+            // `ms:pot:N` sets the MASTER pot (SARADC channel 4) to N (0..1023)
+            if let Some(v) = rest.trim().strip_prefix("pot:") {
+                if let (Ok(t), Ok(value)) = (t.trim().parse::<u64>(), v.trim().parse::<u16>()) {
+                    let at = soc.periph.cycle_of_ms(t);
+                    soc.periph.script.push_back((at, Action::Adc { ch: 4, value: value.min(1023) }));
+                }
+                continue;
+            }
             // `ms:eN:clicks` turns matrix encoder N
             if let Some((e, c)) = rest.strip_prefix('e').and_then(|r| r.split_once(':')) {
                 if let (Ok(t), Ok(enc), Ok(clicks)) = (t.trim().parse::<u64>(), e.parse::<u8>(), c.parse::<i32>()) {
