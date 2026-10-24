@@ -8,7 +8,9 @@ and the plugin's (`crates/fm1-plugin/Cargo.toml`, a workspace of its own) are th
   validator) and fm1-live / fm1-emu;
 - on Linux arm64 and x86-64: fm1-live / fm1-emu;
 
-smoke-tests each fm1-live on FM-1 SID's package, and publishes one GitHub Release: the notes in
+smoke-tests each fm1-live on FM-1 SID's package, plays the whole catalog with the JIT and
+interpreted against `tests/catalog.json` (`.github/workflows/catalog.yml`, which also runs on every
+pull request that changes the emulator), and publishes one GitHub Release: the notes in
 `docs/releases/v<version>.md`, then the pull requests merged since the last release (GitHub's
 list). The page needs no release: it deploys from `master`.
 
@@ -29,6 +31,14 @@ list). The page needs no release: it deploys from `master`.
    ```
 
 The workflow refuses a tag that isn't the version, or a version without its notes.
+
+By hand before the tag (not in CI): M-VAVE's stock firmware and FM1 Open, which are not in the
+catalog, and the speed against the last release (CI machines are too noisy for it):
+`tools/catalog_check.py` plays the catalog in about a minute on an Apple silicon Mac.
+
+A change to the emulator that moves a firmware's sound (timing, an instruction's meaning)
+updates the hashes in the same pull request, `tools/catalog_check.py --update`, and says which
+firmwares changed and why.
 
 Unsigned without the signing secrets (see crates/fm1-plugin/README.md); the notes and each
 archive's README say how to let macOS open the downloads.
