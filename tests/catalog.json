@@ -29,6 +29,11 @@
   "bytes": 1379328,
   "audio": "574af33190fc0f85"
  },
+ "carnac": {
+  "package": "cb76875d78a3d432",
+  "bytes": 1382400,
+  "audio": "7eed2c9179985870"
+ },
  "chipbox": {
   "package": "0a6df3248c07b175",
   "bytes": 1378304,
@@ -43,6 +48,11 @@
   "package": "e2d06d0bfd4cd93b",
   "bytes": 1387008,
   "audio": "ac1b2959f9e39b63"
+ },
+ "clipper": {
+  "package": "3a23a37c431c813b",
+  "bytes": 1376256,
+  "audio": "b3ff2e2cceee52c1"
  },
  "coralflower": {
   "package": "ab7d0744eed0c83d",
@@ -64,10 +74,20 @@
   "bytes": 1387520,
   "audio": "87a5094a108b6a45"
  },
+ "delrio": {
+  "package": "08ee722c36ac3b83",
+  "bytes": 1386496,
+  "audio": "f4f0e92a6fee0152"
+ },
  "dinghy": {
   "package": "5e7dc80d186528cf",
   "bytes": 1378304,
   "audio": "ff083ea4eabd6dbe"
+ },
+ "drift": {
+  "package": "62ca5664c4a00f80",
+  "bytes": 1386496,
+  "audio": "8bbff17371a4a9a3"
  },
  "dub": {
   "package": "35a464983c8b0f11",
@@ -154,6 +174,11 @@
   "bytes": 1387520,
   "audio": "178dd577b697d0fe"
  },
+ "frasil": {
+  "package": "a05a471e467aa38e",
+  "bytes": 1385472,
+  "audio": "36ea1efe7b2bcda5"
+ },
  "frodhes": {
   "package": "3c02a239d87ecfca",
   "bytes": 1379328,
@@ -179,10 +204,20 @@
   "bytes": 1376256,
   "audio": "f9675394d148af82"
  },
+ "golanadz": {
+  "package": "b93e2c9113660370",
+  "bytes": 1376256,
+  "audio": "f9675394d148af82"
+ },
  "grimm": {
   "package": "8f1f6c0bc6c0afb5",
   "bytes": 1378304,
   "audio": "c1863c96adc91f86"
+ },
+ "hera": {
+  "package": "dc0153ecba3daecf",
+  "bytes": 1380352,
+  "audio": "d8e8888bf60252aa"
  },
  "hortator": {
   "package": "c3f17a2823329646",
@@ -214,6 +249,11 @@
   "bytes": 1378304,
   "audio": "f653a022e0b70296"
  },
+ "loom": {
+  "package": "be9c64a8275b5dd5",
+  "bytes": 1384448,
+  "audio": "2f8a18082c981e42"
+ },
  "maku": {
   "package": "b55d471fd1790085",
   "bytes": 1387008,
@@ -238,6 +278,16 @@
   "package": "41ed3ac6287c3452",
   "bytes": 1386496,
   "audio": "806f4282e323a1ca"
+ },
+ "modelar": {
+  "package": "14de4b6efdc55501",
+  "bytes": 1386496,
+  "audio": "a3378ecd475297aa"
+ },
+ "monk": {
+  "package": "76fe9af0ab18b49e",
+  "bytes": 1386496,
+  "audio": "db6fe82f9f91869a"
  },
  "morpheus": {
   "package": "42c3c084c4effa45",
@@ -270,9 +320,9 @@
   "audio": "3d9470bdbd050dc8"
  },
  "obervave": {
-  "package": "d23d844d41408998",
-  "bytes": 1378304,
-  "audio": "6f28cd7b95db8d6a"
+  "package": "51d6a75588cad7e0",
+  "bytes": 1377280,
+  "audio": "0a842d2178ea90c5"
  },
  "opn1": {
   "package": "31b88c6fd4ec081c",
@@ -305,9 +355,9 @@
   "audio": "3c9f0a558c2bf937"
  },
  "rainbow": {
-  "package": "804c77851c4125f1",
-  "bytes": 1387008,
-  "audio": "e09ad922eb39ec45"
+  "package": "4b37e9c229484a38",
+  "bytes": 1386496,
+  "audio": "06055b3529ec4860"
  },
  "shineon": {
   "package": "72070fba5d9c27b6",
@@ -324,13 +374,18 @@
   "bytes": 1378304,
   "audio": "5039668157b30ccd"
  },
+ "sidou": {
+  "package": "bcba824441b0ee62",
+  "bytes": 1339392,
+  "audio": "c9fbbc8608416711"
+ },
  "skiff": {
   "package": "0622a752e8304777",
   "bytes": 1386496,
   "audio": "083a7ce8f65e5242"
  },
  "sloop": {
-  "package": "fb69b4311790eb7e",
+  "package": "64c9dfa7e75312de",
   "bytes": 1376256,
   "audio": "00148af1d2925f4e"
  },
@@ -353,6 +408,11 @@
   "package": "133aa53357e9fc2e",
   "bytes": 1376256,
   "audio": "34eb5c75ab425e2e"
+ },
+ "tessera": {
+  "package": "f00df5266b41d4f8",
+  "bytes": 1371648,
+  "audio": "9695c5e16c89cf9a"
  },
  "tonitor": {
   "package": "20e85fbd0a7361fd",
@@ -405,8 +465,8 @@
   "audio": "8c8601a36aa449f7"
  },
  "zp12": {
-  "package": "0d9bc8c314a7d1df",
-  "bytes": 1378304,
-  "audio": "fdc10eb028fd42e3"
+  "package": "fb1e6bfc01a74f14",
+  "bytes": 1378816,
+  "audio": "38ff911dc3665d46"
  }
 }
