@@ -144,6 +144,11 @@
   "bytes": 1363968,
   "audio": "556512248d64563c"
  },
+ "fm1dock": {
+  "package": "aacf3f160d5bb059",
+  "bytes": 1378304,
+  "audio": "ff083ea4eabd6dbe"
+ },
  "fm1doom": {
   "package": "6e23e322d16923e8",
   "bytes": 1379328,
