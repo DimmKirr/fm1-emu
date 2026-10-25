@@ -93,9 +93,9 @@ Locally, `SIGN_IDENTITY="Developer ID Application: …" tools/build_plugin.sh` t
 - **Master** is the panel's MASTER pot, and a host parameter you can automate.
 - **CPU clock** is the emulated chip's clock: 240 MHz by default (the chip's nominal clock),
   or 120, 160, 320 or 400. Most of a firmware's cost grows with the clock, so a lower one lets a
-  heavy firmware keep up on a slower computer (on an M1 Pro, CS-1 goes from 1.2x real time at
-  240 MHz to 1.65x at 160, FM-106 from 0.9x to 1.1x), as long as the firmware still gets its work
-  done. A higher one gives a firmware that runs out of time more; the emulator runs one
+  heavy firmware keep up on a slower computer (CS-1 and FM-106 run about 1.3x as fast at 160 MHz
+  as at 240, 1.5x at 120, with the same sound), as long as the firmware still gets its work done.
+  A higher one gives a firmware that runs out of time more; the emulator runs one
   instruction a cycle, while the chip runs some in pairs. Changing it restarts the firmware,
   keeping its flash.
 - **The panel** works as on the page:
