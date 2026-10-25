@@ -1,0 +1,3 @@
+[submodule "fm1-sid"]
+	path = fm1-sid
+	url = https://github.com/joakimeriksson/fm1-sid.git

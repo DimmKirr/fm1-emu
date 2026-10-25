@@ -30,7 +30,8 @@ fetched that way, so download `FM-1.fwsc` from M-VAVE and open it on the page.
 And the **[M-VAVE SMK-37](https://joakimeriksson.github.io/fm1-emu/smk37/)**: a 37-key keyboard with
 the FM-1's chip inside, whose community ports run here too ([below](#the-smk-37)).
 
-Also here: **[FM-1 SID](fm1-sid/)**, a firmware that turns the FM-1 into a Commodore 64 SID
+Also here: **[FM-1 SID](https://github.com/joakimeriksson/fm1-sid)** (`fm1-sid/`, a submodule: clone with
+`--recurse-submodules`), a firmware that turns the FM-1 into a Commodore 64 SID
 synth, with a step sequencer and stereo chorus, delay and reverb, that also plays C64 tunes
 ([its page](https://joakimeriksson.github.io/fm1-emu/fm1-sid/) plays all of HVSC).
 
@@ -313,14 +314,15 @@ How it was built and checked, step by step, is told in a technical report:
 - `docs/`: the hardware notes (`recon.md`), the instruction set (`isa-notes.md`), M-VAVE's
   firmware (`stock-firmware.md`); `PLAN.md` is the work log
 - `tools/`, `probes/`: ISA extraction, benchmarks, differential test programs
-- `fm1-sid/`: the SID study and player firmware (its own README)
+- `fm1-sid/`: the SID study and player firmware, [joakimeriksson/fm1-sid](https://github.com/joakimeriksson/fm1-sid) as a submodule
+  (its own README; `git submodule update --init` after a plain clone)
 
 ## Licences
 
 The emulator is MIT (`LICENSE`). The firmwares are their authors' and are not part of this
-repository; the page fetches them from the authors' sites. `fm1-sid/` has files under other
-licences, among them its player firmware, GPL-3.0 since it is built on Felucca's code:
-its README lists them. The plugin (`crates/fm1-plugin`) is MIT too; the libraries and SDKs it
+repository; the page fetches them from the authors' sites. `fm1-sid/` (its own repository) has
+files under other licences, among them its player firmware, GPL-3.0 since it is built on
+Felucca's code: its LICENSING.md lists them. The plugin (`crates/fm1-plugin`) is MIT too; the libraries and SDKs it
 builds with are MIT, ISC or Apache-2.0.
 
 ## Credits

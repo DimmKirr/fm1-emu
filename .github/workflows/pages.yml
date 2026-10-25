@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true      # fm1-sid/: joakimeriksson/fm1-sid
 
       - uses: actions/setup-node@v4
         with:
@@ -76,6 +78,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true      # fm1-sid/: joakimeriksson/fm1-sid
 
       - name: Rust and ALSA headers
         run: |
@@ -109,6 +113,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true      # fm1-sid/: joakimeriksson/fm1-sid
 
       - name: Rust and ALSA headers
         run: |
@@ -139,6 +145,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true      # fm1-sid/: joakimeriksson/fm1-sid
 
       - name: Core tests
         run: cargo test --release -p fm1-isa -p fm1-core -p fm1-soc
