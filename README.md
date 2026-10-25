@@ -33,7 +33,9 @@ the FM-1's chip inside, whose community ports run here too ([below](#the-smk-37)
 Also here: **[FM-1 SID](https://github.com/joakimeriksson/fm1-sid)** (`fm1-sid/`, a submodule: clone with
 `--recurse-submodules`), a firmware that turns the FM-1 into a Commodore 64 SID
 synth, with a step sequencer and stereo chorus, delay and reverb, that also plays C64 tunes
-([its page](https://joakimeriksson.github.io/fm1-emu/fm1-sid/) plays all of HVSC).
+and GoatTracker songs ([its page](https://joakimeriksson.github.io/fm1-emu/fm1-sid/) plays all of HVSC).
+On a real FM-1 it is its own firmware on [fm1-dock](https://github.com/joakimeriksson/fm1-dock), which
+keeps USB, the installers and the rescue.
 
 ## What runs
 
@@ -123,7 +125,7 @@ too; `&embed=1` shows only the device and its controls, for a window on another 
 | [FM1 Quest 38](https://joakimeriksson.github.io/fm1-emu/?fw=quest) | [hericdk](https://github.com/hericdk/fm1-quest) | A live RPG adventure inside the synth. |
 | [Rainbow Mode 1.1.5-rb](https://joakimeriksson.github.io/fm1-emu/?fw=rainbow) | [joshbartlettband-web](https://github.com/joshbartlettband-web/felucca-rainbow) | A music toy for little hands (a Felucca fork). |
 | [Shine On 3.0.1](https://joakimeriksson.github.io/fm1-emu/?fw=shineon) | [zvenson](https://github.com/zvenson/shineon) | A string ensemble in the spirit of the late-70s machines, grown out of OberVave: divide-down keyers with 16', 8' and 4' footages, register filters, a three-tap BBD ensemble and a phaser, on two tracks with the sequencer. |
-| [FM-1 SID 0.1](https://joakimeriksson.github.io/fm1-emu/?fw=sid) | [joakimeriksson](https://github.com/joakimeriksson/fm1-emu/tree/master/fm1-sid) | A SID chip on the FM-1, as a synth: the keys play 12 instruments, KNOB1-4 are cutoff, resonance, attack, release; FX opens chorus, delay and reverb. |
+| [FM-1 SID 0.2](https://joakimeriksson.github.io/fm1-emu/?fw=sid) | [joakimeriksson](https://github.com/joakimeriksson/fm1-sid) | A SID chip on the FM-1, its own firmware on fm1-dock (fm1-dock's USB, installer and rescue; the sine as the fallback): a C64 tune player (reSID 0.16 and a 6510 running the tune's own code, PSID and RSID) starting with GoatTracker 2's example songs, Dojo first; a GoatTracker editor; and a synth: the keys play 12 instruments, KNOB1-4 are cutoff, resonance, attack, release; FX opens chorus, delay and reverb. |
 | [SID-1 1.0.0](https://joakimeriksson.github.io/fm1-emu/?fw=sid1) | [putchdev](https://github.com/putchdev/sid-1) | The Commodore 64's SID chip, twice for six voices. |
 | [SIDOU 0.3.1](https://joakimeriksson.github.io/fm1-emu/?fw=sidou) | [Denis Sablić](https://github.com/dsablic/sidou) | Turns the FM-1 into a C64 SID machine: two SIDs (6581 and 8580) with the chip's character dialled in, a GoatTracker 2 compatible tracker and step sequencer, and a live instrument to play over a song. |
 | [Skiff 1.4](https://joakimeriksson.github.io/fm1-emu/?fw=skiff) | [illuminus5](https://github.com/illuminus5/skiff) | A six-track groovebox built on Felucca 1.1.5: fourteen synth and drum engines, a 64-step sequencer with chords, ratchets and locks, songs and a performance layer. |
