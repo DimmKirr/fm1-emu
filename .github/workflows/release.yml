@@ -34,6 +34,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true      # fm1-sid/: joakimeriksson/fm1-sid
 
       - uses: actions/setup-node@v4
         with:
@@ -124,6 +126,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true      # fm1-sid/: joakimeriksson/fm1-sid
 
       - name: Rust and the window / audio / MIDI headers
         run: |
@@ -156,6 +160,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true      # fm1-sid/: joakimeriksson/fm1-sid
 
       - uses: actions/download-artifact@v4
         with:
