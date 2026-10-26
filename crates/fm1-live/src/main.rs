@@ -62,6 +62,8 @@ struct Opts {
     bench: Option<u64>,
     /// Headless: run this many ms with a chord held, save the panel image.
     shot: Option<u64>,
+    /// --record DIR: dump numbered PPM frames + audio.raw while running --shot.
+    record: Option<String>,
     /// What runs, for the window title.
     name: String,
     /// M-VAVE's stock firmware from its update package (fm1_soc::stock_from_package)
@@ -106,7 +108,7 @@ fn catalog() -> Vec<(String, String, String, String)> {
 fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
-                       name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
+                       record: None, name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
                        flaky_core1: None, seed: None, flash: None, usb: false };
     let mut i = 1;
     while i < a.len() {
@@ -151,6 +153,7 @@ fn parse() -> Option<Opts> {
             "--flaky-core1" => o.flaky_core1 = Some(a.get(i + 1)?.parse::<f64>().ok().filter(|r| (0.0..=1.0).contains(r))?),
             "--seed" => o.seed = Some(a.get(i + 1)?.parse().ok()?),
             "--flash" => o.flash = Some(a.get(i + 1)?.clone()),
+            "--record" => o.record = Some(a.get(i + 1)?.clone()),
             _ => return None,
         }
         i += 2;
@@ -514,6 +517,44 @@ fn script_keys(m: &mut Machine) -> bool {
     true
 }
 
+fn record_frame(m: &mut Machine, dir: &str, frame: u64, audio: &mut Option<std::io::BufWriter<std::fs::File>>) {
+    use std::io::Write;
+    let leds = m.soc.periph.led_take();
+    let down = [false; 41];
+    let (pw, ph) = if m.soc.board == fm1_soc::Board::Smk37 { (panel_smk::W, panel_smk::H) } else { (W, H) };
+    let mut buf = vec![0u32; pw * ph];
+    if m.soc.board == fm1_soc::Board::Smk37 {
+        let p = &mut m.soc.periph.smk;
+        let sleds = p.led_take();
+        let (pads, force, faders) = (p.pads, std::array::from_fn(|i| p.analog(i as u8)), std::array::from_fn(|i| p.analog(16 + i as u8)));
+        let mut sdown = [false; 64];
+        sdown[..55].copy_from_slice(&p.down);
+        let st = panel_smk::State {
+            lcd: &m.soc.lcd.fb, enc_clicks: &[0; 8], turning: &[0; 8],
+            down: &sdown, leds: &sleds, pads: &pads, pad_force: &force, faders: &faders,
+            pitch: p.analog(fm1_soc::smk::ANALOG_PITCH), modw: p.analog(fm1_soc::smk::ANALOG_MOD),
+        };
+        panel_smk::draw(&mut buf, &panel_smk::base(), &st);
+    } else {
+        let st = panel::State {
+            lcd: &m.soc.lcd.fb, enc_clicks: &[0; 7], pot: m.soc.periph.adc_value[4],
+            down: &down, leds: &leds, turning: &[0; 8],
+        };
+        panel::draw(&mut buf, &panel::base(), &st);
+    }
+    let path = format!("{dir}/{frame:06}.ppm");
+    let mut ppm = format!("P6\n{pw} {ph}\n255\n").into_bytes();
+    for p in &buf {
+        ppm.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
+    }
+    std::fs::write(&path, ppm).expect("write frame PPM");
+    if let Some(w) = audio {
+        for s in m.soc.periph.audio.drain(..) {
+            let _ = w.write_all(&s.to_le_bytes());
+        }
+    }
+}
+
 fn shot(o: &Opts, ms: u64) {
     let mut m = match Machine::new(o) {
         Ok(m) => m,
@@ -545,6 +586,17 @@ fn shot(o: &Opts, ms: u64) {
     let want_skip = m.soc.periph.skip_idle;
     m.soc.periph.skip_idle = want_skip && skip_from == 0;
     let mut usb_sends = usb_script();
+
+    let mut rec_audio: Option<std::io::BufWriter<std::fs::File>> = None;
+    let mut rec_frame: u64 = 0;
+    let mut rec_next_ms: u64 = 0;
+    if let Some(dir) = &o.record {
+        std::fs::create_dir_all(dir).expect("create record dir");
+        let af = std::fs::File::create(format!("{dir}/audio.raw")).expect("create audio.raw");
+        rec_audio = Some(std::io::BufWriter::new(af));
+        rec_next_ms = 0;
+    }
+
     while m.soc.periph.ms() + 40 < ms {
         if want_skip && m.soc.periph.ms() >= skip_from {
             m.soc.periph.skip_idle = true;
@@ -553,6 +605,12 @@ fn shot(o: &Opts, ms: u64) {
             return halted(&e);
         }
         usb_headless(&mut m, &mut usb_sends);
+
+        if o.record.is_some() && m.soc.periph.ms() >= rec_next_ms {
+            record_frame(&mut m, o.record.as_deref().unwrap(), rec_frame, &mut rec_audio);
+            rec_frame += 1;
+            rec_next_ms = rec_frame * 16;
+        }
     }
     if o.usb {
         let u = &m.soc.usb;
@@ -613,6 +671,15 @@ fn shot(o: &Opts, ms: u64) {
             println!("work/panel.ppm at {} ms; LEDs lit: {lit:?}; audio peak over the last 0.5 s: {peak}", m.soc.periph.ms())
         }
         Err(e) => eprintln!("work/panel.ppm: {e}"),
+    }
+    if let Some(ref mut w) = rec_audio {
+        use std::io::Write;
+        for s in m.soc.periph.audio.drain(..) {
+            let _ = w.write_all(&s.to_le_bytes());
+        }
+        w.flush().expect("flush audio.raw");
+        let dir = o.record.as_deref().unwrap();
+        println!("recorded {rec_frame} frames + audio.raw -> {dir}/");
     }
     save_flash(&m, o.flash.as_ref());
 }
@@ -825,6 +892,7 @@ options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--fl
          [--flaky-core1 RATE [--seed N]] [--version] [--help]
 headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
           --shot MS    run MS ms, then write the panel to work/panel.ppm
+          --record DIR with --shot: dump PPM frames every 16 ms + audio.raw (44.1 kHz stereo s16le)
 env: FM1_BENCH_KEYS='T[-T2]:PLAY,T:n7,T:enc0:+3,T:pot:512,T:ms:mHEX'  scripted input (--bench, --shot;
                          times in ms, mHEX: MIDI bytes into the DIN jack)
      FM1_BENCH_WAV=FILE    --bench: the audio (44.1 kHz stereo s16le, no header)
