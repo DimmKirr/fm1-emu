@@ -4,7 +4,7 @@
 //! that is the host's "Master" parameter), and a bar to load a firmware package.
 
 use crate::engine::Cmd;
-use crate::{panel, panel_smk, Fm1Params, Link};
+use crate::{panel, panel_smk, Clock, Fm1Params, Link};
 use fm1_soc::Board;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets};
@@ -120,8 +120,18 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                 bar.separator();
                 bar.label("MIDI channel");
                 bar.add(widgets::ParamSlider::for_param(&params.channel, setter).with_width(90.0));
-                bar.label("CPU clock").on_hover_text("The emulated FM-1's clock, 240 MHz as on the chip. Raise it if a firmware runs out of time; each step costs this computer's CPU. Changing it restarts the firmware");
-                bar.add(widgets::ParamSlider::for_param(&params.clock, setter).with_width(90.0));
+                bar.label("CPU clock").on_hover_text("The emulated FM-1's clock, 240 MHz as on the chip. Lower it if this computer can't keep up with a heavy firmware (\"frames late\"); raise it if a firmware runs out of time. Changing it restarts the firmware");
+                // a menu in the clocks' order (the parameter's own order keeps v0.2.0's projects)
+                let now = params.clock.value();
+                egui::ComboBox::from_id_salt("clock").width(90.0).selected_text(now.name()).show_ui(bar, |menu| {
+                    for c in Clock::ALL {
+                        if menu.selectable_label(c == now, c.name()).clicked() && c != now {
+                            setter.begin_set_parameter(&params.clock);
+                            setter.set_parameter(&params.clock, c);
+                            setter.end_set_parameter(&params.clock);
+                        }
+                    }
+                });
                 bar.separator();
                 let status = if !ui.msg.is_empty() {
                     ui.msg.clone()

@@ -64,25 +64,47 @@ pub struct Fm1Params {
 
 /// The emulated clock. The emulator runs one instruction a cycle at the chip's nominal 240 MHz,
 /// while the AC791N runs some instructions in dual-issue pairs, so a firmware that runs out of
-/// time can be given more. Each step costs host CPU (X0X on an M4 Pro: ~2.3x real time at 240,
-/// 1.7x at 320, 1.3x at 400).
+/// time can be given more. A firmware that idles in loops the emulator cannot skip costs host
+/// CPU in proportion to the clock, so a lower one lets a heavy firmware keep up on a slower
+/// computer (CS-1 and FM-106 run about 1.3x as fast at 160 MHz as at 240, 1.5x at 120), as long
+/// as the firmware still has the time it needs.
+///
+/// v0.2.0 saved the clock as its variant's index, so 240, 320 and 400 keep theirs (0, 1, 2) and
+/// the lower clocks come after them; each now saves its id. [`Clock::ALL`] is the menu's order.
 #[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Clock {
+    #[id = "240"]
     #[name = "240 MHz"]
     Mhz240,
+    #[id = "320"]
     #[name = "320 MHz"]
     Mhz320,
+    #[id = "400"]
     #[name = "400 MHz"]
     Mhz400,
+    #[id = "120"]
+    #[name = "120 MHz"]
+    Mhz120,
+    #[id = "160"]
+    #[name = "160 MHz"]
+    Mhz160,
 }
 
 impl Clock {
+    pub const ALL: [Clock; 5] = [Clock::Mhz120, Clock::Mhz160, Clock::Mhz240, Clock::Mhz320, Clock::Mhz400];
+
     pub fn mhz(self) -> u64 {
         match self {
+            Clock::Mhz120 => 120,
+            Clock::Mhz160 => 160,
             Clock::Mhz240 => 240,
             Clock::Mhz320 => 320,
             Clock::Mhz400 => 400,
         }
+    }
+
+    pub fn name(self) -> String {
+        format!("{} MHz", self.mhz())
     }
 }
 
@@ -337,5 +359,20 @@ mod b64 {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<Vec<u8>>, D::Error> {
         let s = String::deserialize(d)?;
         base64::engine::general_purpose::STANDARD.decode(s).map(Arc::new).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v0_2_0_projects_keep_their_clock() {
+        // v0.2.0 saved the clock as its index: 0, 1, 2 for 240, 320, 400
+        assert_eq!([0, 1, 2].map(|i| Clock::from_index(i).mhz()), [240, 320, 400]);
+        // the menu goes up the clocks, and each saves an id of its own
+        assert!(Clock::ALL.windows(2).all(|w| w[0].mhz() < w[1].mhz()));
+        let ids = Clock::ids().unwrap();
+        assert!(Clock::ALL.iter().all(|c| ids[c.to_index()] == c.mhz().to_string()));
     }
 }
