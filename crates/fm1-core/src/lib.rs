@@ -3196,10 +3196,17 @@ impl Cpu {
             22 => {
                 // `R = rev8(R)` (70 e0 00): d = bits(28,31), src = bits(24,27); `70 e0 80`:
                 // rD = revs(rS.l), the low half's bytes swapped and sign-extended (the vendor
-                // compiler's `(short)__builtin_bswap16(x)`, work/probe/sem.c)
+                // compiler's `(short)__builtin_bswap16(x)`, work/probe/sem.c); `70 e0 40`
+                // rev16, each half's bytes swapped (FM-1 V16 swaps 16-bit samples two at a time
+                // with it, rev8 >> 16 for the last one); `70 e0 c0` popcnt (the vendor objdump)
                 let d = ((raw >> 28) & 0xf) as usize;
                 let x = self.regs[((raw >> 24) & 0xf) as usize];
-                self.regs[d] = if raw & 0x80_0000 != 0 { (x as u16).swap_bytes() as i16 as i32 as u32 } else { x.swap_bytes() };
+                self.regs[d] = match (raw >> 22) & 3 {
+                    0 => x.swap_bytes(),
+                    1 => (x & 0x00ff_00ff) << 8 | (x >> 8) & 0x00ff_00ff,
+                    2 => (x as u16).swap_bytes() as i16 as i32 as u32,
+                    _ => x.count_ones(),
+                };
             }
             27 => {
                 // `{rets, rN..rB} = [sp++]` (3n 04): like the pc pops but the
@@ -3424,6 +3431,11 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // `70 e0 00 DS` / `70 f0 00 DS`: rD = rev8(rS) (route 22; 690 corpus samples)
         Err(_) if win & 0xff_ffff == 0x00_e070 => raw(&REV8_CRAW),
         Err(_) if win & 0xff_ffff == 0x00_f070 => raw(&REV8_PAIR_CRAW),
+        // `70 e0 40 DS` rev16, `70 e0 c0 DS` popcnt (route 22; the vendor objdump --mcpu=r3)
+        Err(_) if win & 0xff_ffff == 0x40_e070 => raw(&REV16_CRAW),
+        Err(_) if win & 0xff_ffff == 0x40_f070 => raw(&REV16_PAIR_CRAW),
+        Err(_) if win & 0xff_ffff == 0xc0_e070 => raw(&POPCNT_CRAW),
+        Err(_) if win & 0xff_ffff == 0xc0_f070 => raw(&POPCNT_PAIR_CRAW),
         // `dc` / `de` with ec/ed/ee: loads / stores that pre- or post-increment the base by a
         // register (route 32, `idx_inc`): the classes fit only the corpus registers
         // (SLOOP 2.6's `b[r2++=r0] = r1`)
@@ -3601,6 +3613,22 @@ static REV8_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 };
 static REV8_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "rev8_craw", syntax: "R = rev8(R)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static REV16_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rev8_craw", syntax: "R = rev16(R)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static REV16_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rev8_craw", syntax: "R = rev16(R)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static POPCNT_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rev8_craw", syntax: "R = popcnt(R)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static POPCNT_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rev8_craw", syntax: "R = popcnt(R)  #", len: 4, count: 0, mask: 0, match_: 0,
     group: "alu", alt: &[], samples: &[], slots: &[],
 };
 static CMP_RR_BRANCH6_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
@@ -6523,9 +6551,11 @@ fn fcond(c: Cond, l: u32, r: u32) -> bool {
 }
 
 /// The FPU ops (`3f e5`, see fm1-isa's fpu.rs): binary op 0 +, 1 -, 2 *, 3 /, 5 fmin, 6 fmax on
-/// (a, b); unary 0x1f ftoi, 0x5f ftou (both truncating), 0x8f itof, 0x9f utof on a.
+/// (a, b); unary `K f` on a: K 0..3 ftoi, 4..7 ftou, c..f ftof (a whole float), rounding by
+/// K & 3 (0 to nearest even, 1 trunc, 2 ceil, 3 floor); 0x8f itof, 0x9f utof.
 fn fpu(op: u8, a: u32, b: u32) -> u32 {
     let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+    let round = |k: u8| match k & 3 { 0 => x.round_ties_even(), 1 => x.trunc(), 2 => x.ceil(), _ => x.floor() };
     match op {
         0 => (x + y).to_bits(),
         1 => (x - y).to_bits(),
@@ -6533,10 +6563,13 @@ fn fpu(op: u8, a: u32, b: u32) -> u32 {
         3 => (x / y).to_bits(),
         5 => x.min(y).to_bits(),
         6 => x.max(y).to_bits(),
-        0x1f => x as i32 as u32,
-        0x5f => x as u32,
         0x8f => (a as i32 as f32).to_bits(),
-        _ => (a as f32).to_bits(),
+        0x9f => (a as f32).to_bits(),
+        _ => match op >> 4 {
+            k @ 0..=3 => round(k) as i32 as u32,
+            k @ 4..=7 => round(k) as u32,
+            k => round(k).to_bits(),
+        },
     }
 }
 

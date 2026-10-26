@@ -345,10 +345,12 @@ when it reproduces every (raw, value) example the solver kept for it.
 
 - **FPU** (`-mcpu=r3`; objdump prints `<unknown instruction>`): `3f e5 b2 b3` on the ordinary
   registers. Binary `R = R op R (f)`: op = b2 & 15 (0 +, 1 -, 2 *, 3 /, 5 fmin, 6 fmax),
-  a = b2 >> 4, d = b3 >> 4, b = b3 & 15. Unary: b2 = 1f ftoi (trunc), 5f ftou (trunc),
-  8f itof, 9f utof; d = b3 >> 4, s = b3 & 15. `3f f5` is the same op as a dual-issue pair
+  a = b2 >> 4, d = b3 >> 4, b = b3 & 15. Unary: b2 = K f, K 0..3 ftoi, 4..7 ftou, c..f ftof
+  (to a whole float), rounding by K & 3: 0 (even), 1 (trunc), 2 (ceil), 3 (floor); 8f itof,
+  9f utof; d = b3 >> 4, s = b3 & 15 (the roundings from the vendor assembler and
+  `objdump --mcpu=r3`, which prints the FPU; FM-1 V16 uses ftoi (even)). `3f f5` is the same op as a dual-issue pair
   head (bit 12, as e0/e1 vs f0/f1; `-mfprev1` makes the compiler pair them). The stock app
-  also has ops 7 and 8 (14 each), still unknown. Encodings from the vendor assembler
+  also has ops 7 and 8: `R += R * R (f)` and `R -= R * R (f)` (the vendor assembler). Encodings from the vendor assembler
   (`work/probe/fpu_ops.S`, `fcmp_*.S`); `probes/fpu.c` checks 1464 cases against LLVM's folding.
 - **Float compares** `iff`: the integer `if (R op R) goto` (4-byte: flag bit 27; 6-byte
   `4x ff`: bit 23) and `if (R op R) {` (bit 23) with a float flag. Families: e8 ordered ==,
@@ -417,6 +419,8 @@ in `decode_any`, which `fetch_at`, `block_end`, `describe` and the flags lookahe
   90440 block heads print as `if (...) {`; in family ea byte0 9x..bx are calls): Quest 0.21's
   `1d ea 80 a6` `if ((r13 & r6) != 0) {` with 3 + 2 units.
 - `70 e0/f0 00 DS` rD = rev8(rS) (690 samples): Quest 0.21's `r8 = rev8(r0)`.
+  `70 e0 40 DS` rev16 (each half's bytes swapped; FM-1 V16 swaps 16-bit samples with it),
+  `70 e0 80 DS` revs(rS.l), `70 e0 c0 DS` popcnt (the vendor objdump --mcpu=r3).
 - `d0 e9` register pairs at sp+off, `decode_pair_mem` (9701 samples): WaveLoop Kit's
   `d[sp+1044] = r13_r12`.
 - `dc` `[++rB=rI]` / `de` `[rB++=rI]` with ec/ed/ee (3462 samples, route 32): base = bits(20,23),

@@ -537,9 +537,10 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
             g.a.bind(taken);
             g.chain(next_pc, count);
         }
-        // (the multiply-accumulates 7 / 8 read d too, min / max are Rust's: through the
+        // (the multiply-accumulates 7 / 8 read d too, min / max are Rust's, and the rounding
+        // conversions other than trunc have no single SSE instruction here: through the
         // interpreter's executor)
-        Fast::FOp { d, a, b, op } if !matches!(op, 5..=8) => {
+        Fast::FOp { d, a, b, op } if matches!(op, 0..=3 | 0x1f | 0x5f | 0x8f | 0x9f) => {
             g.ld_reg(RAX, a);
             match op {
                 0..=3 => {
