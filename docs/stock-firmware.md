@@ -1,7 +1,7 @@
 # M-VAVE's stock firmware, and the second core
 
-The emulator runs M-VAVE's own firmware (V13 and the current V15 tested) straight from its update
-package, with both cores:
+The emulator runs M-VAVE's own firmware (V13, V15 and the current V16 tested) straight from its
+update package, with both cores:
 
     fm1-live --fwsc FM-1.fwsc [--syx bank.syx]
     fm1-emu  --fwsc FM-1.fwsc --ms 5000 --keys "2500-4000:n7" --wav out.wav
@@ -39,6 +39,9 @@ firmwares from their whole package.
 | `idle` | 0.44x real time | waits for an interrupt: with `skip_idle`, time jumps to the next event |
 | random number generator (`0x13B00`) | ~8 s after boot the UI froze and keys were ignored | xorshift from a fixed seed; a routine in the audio driver parks its task when a random word equals a fixed descrambled one, which a constant 0 always did |
 | two stacks | interrupts clobbered task stacks or tasks never switched | see below |
+| the protected image decrypted to its end (V16) | no screen, keys ignored: the synth engine's start returned early | the package is decrypted up to its `PRCT` entry's end, not the app area's: right after the area is the `EXT_RESERVED` directory (`USER` at flash 0xED000, 0x12000), found by walking from the area's head by its size; without it `mnt/sdfile/EXT_RESERVED/user` does not open and neither the engine nor the UI task starts |
+| FPU roundings, `rev16` (V16) | halts on `3f e5 0f 33`, then `70 f0 40 33` | `ftoi` / `ftou` / `ftof` with (even), (trunc), (ceil), (floor); `rev16`, `popcnt` (see isa-notes) |
+| SPI1's interrupt after the transfer (V16) | the UI froze under an interrupt storm | V16's LCD driver enables the interrupt, starts the DMA and then marks it running: an interrupt at the start found the handler idle, which returned without clearing it. It now comes after the bytes' time on the wire, as on the SMK-37 (the done bit still reads set at once). V15 plays the same audio; it idles less (its flush waits as on hardware) |
 
 ## The stack model (`Cpu::user`)
 

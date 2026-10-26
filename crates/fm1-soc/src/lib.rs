@@ -315,7 +315,7 @@ impl Soc {
     }
 
     /// A package boot: the chip key, and SFCENC as the loader leaves it for the installed
-    /// package (decrypted up to flash `app_end`, the app area's end, and as stored above:
+    /// package (decrypted up to flash `app_end`, the protected image's end, and as stored above:
     /// CON 3, UNENC_L there, UNENC_H 0x07FFFFFF). The firmware's own window replaces it
     /// (Felucca's fm1_flash.h: CON &= ~2, UNENC_L / _H, CON |= 2; stock 0x93000, FM1 Open
     /// 0x73000, April OS 0x64000); a `--flash` file restored after this reads the same way.
@@ -647,16 +647,18 @@ impl Soc {
         self.periph.spi2_start(bytes, baud, con & 0x2000 != 0);
     }
 
-    /// A SPI1 transfer finished (instantly here): with CON bit 13 (interrupt enable) that is
-    /// IRQ 16, the stock LCD driver's DMA-done (its layer flush waits for the handler).
-    /// (SMK-37: it takes the bytes' time on the wire, see `Periph::spi1_start`.)
+    /// A SPI1 transfer finished: with CON bit 13 (interrupt enable) that is IRQ 16, the stock
+    /// LCD driver's DMA-done (its layer flush waits for the handler). The interrupt comes after
+    /// the bytes' time on the wire (`Periph::spi1_start`): FM-1 V16's driver enables it, starts
+    /// the DMA and only then marks the DMA as running, so an interrupt at the start found its
+    /// handler idle, which returned without clearing it, again and again. On the FM-1 the
+    /// transfer-done bit still reads as set at once (polls finish); the SMK-37's is busy until the
+    /// bytes have gone out.
     fn spi1_done(&mut self, bytes: u32) {
         let irq = self.sfr_get(0x11d00) & 0x2000 != 0;
-        if self.board == Board::Smk37 {
+        if self.board == Board::Smk37 || irq {
             let baud = self.sfr_get(0x11d04);
             self.periph.spi1_start(bytes, baud, irq);
-        } else if irq {
-            self.periph.spi1_pending = true;
         }
     }
 
@@ -1067,7 +1069,8 @@ pub struct Stock {
     pub identity: String,
     /// The chip key the package's app area is scrambled with.
     pub key: u16,
-    /// The app area's end in flash: decrypted up to here as installed (`Soc::sfc_boot`).
+    /// The protected image's end in flash (`fwsc::Unpacked::end`): decrypted up to here as
+    /// installed (`Soc::sfc_boot`).
     pub app_end: usize,
     /// FM-1 user bank, if this package has one.
     pub usr: Option<usize>,
@@ -1089,7 +1092,7 @@ pub fn stock_from_package(pkg: &[u8], syx: Option<&[u8]>) -> Result<Stock, Strin
     }
     let app = u.entry("app.bin").map(|h| h.offset).unwrap_or(0x120);
     let usr = fwsc::usr_offset(&u).filter(|_| board == Board::Fm1);
-    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity, key: u.key, app_end: u.area + u.size, usr })
+    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity, key: u.key, app_end: u.end, usr })
 }
 
 /// Ready a Soc for a package's firmware: its board, its flash chip, and the SPL's boot

@@ -71,6 +71,10 @@ pub struct Unpacked {
     pub area: usize,
     /// The app area's size (its head's), from `area`.
     pub size: usize,
+    /// Where the protected image ends in flash (the area's `PRCT` entry; else the app area's
+    /// end): decrypted up to here. Past the app area it holds the `EXT_RESERVED` directory, whose
+    /// entries name reserved areas past the image (V16's `USER` bank at 0xED000).
+    pub end: usize,
     /// The app area's directory: app.bin (offset in the area), the reserved areas VM, PRCT,
     /// BTIF, USR (flash offsets).
     pub dir: Vec<Head>,
@@ -234,7 +238,24 @@ fn unpack_n(file: &[u8], blocks: usize) -> Result<Unpacked, String> {
     if !dir.iter().any(|h| h.name == "app.bin") {
         return Err("no app.bin in the app area".into());
     }
-    Ok(Unpacked { identity: String::new(), raw, xip: flash[area..].to_vec(), area, size, dir, key })
+    // The SFC decrypts the whole protected image, not only the app area (the stock firmware sets
+    // its own window to the image's end: 0x93000 on V15). Right after the area comes the
+    // `EXT_RESERVED` directory: V16 finds its `USER` bank through it (sdfile walks from the area's
+    // head by its size), and without it the synth engine and the UI never start. The area may end
+    // mid-block: the block it ends in is decrypted again from its start.
+    let end = dir
+        .iter()
+        .find(|h| h.name == "PRCT" && h.offset == 0)
+        .map(|h| h.size)
+        .filter(|&e| e > area + size && e <= flash.len())
+        .unwrap_or(area + size);
+    if end > area + size {
+        let blk = area + first + ((area + size).saturating_sub(area + first) & !31);
+        let mut t = raw[..end].to_vec();
+        unscramble(&mut t, blk, end - blk, area, key);
+        flash[area + size..end].copy_from_slice(&t[area + size..end]);
+    }
+    Ok(Unpacked { identity: String::new(), raw, xip: flash[area..].to_vec(), area, size, end, dir, key })
 }
 
 /// The SMK-37's factory calibration record (USRTRIM, flash 0xC1000; fm1-to-smk37 docs/01, 2.1):

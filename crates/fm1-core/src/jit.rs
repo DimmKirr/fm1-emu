@@ -1222,8 +1222,9 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
             g.a.bind(taken);
             g.chain(next_pc, count);
         }
-        // (the multiply-accumulates 7 / 8 read d too: through the interpreter's executor)
-        Fast::FOp { d, a, b, op } if !matches!(op, 7 | 8) => {
+        // (the multiply-accumulates 7 / 8 read d too, and the rounding conversions other than
+        // trunc have no single A64 instruction here: through the interpreter's executor)
+        Fast::FOp { d, a, b, op } if matches!(op, 0..=6 | 0x1f | 0x5f | 0x8f | 0x9f) => {
             g.ld_reg(0, a);
             match op {
                 0x1f | 0x5f => {
@@ -2314,7 +2315,7 @@ mod tests {
                 cases.push(Fast::DecBr { r: 3, cond, v: 5, target: 0x40 });
             }
         }
-        for fop in [0u8, 1, 2, 3, 5, 6, 7, 8, 0x1f, 0x5f, 0x8f, 0x9f] { // (the ops fm1-isa decodes)
+        for fop in [0u8, 1, 2, 3, 5, 6, 7, 8, 0x0f, 0x1f, 0x2f, 0x3f, 0x4f, 0x5f, 0x6f, 0x7f, 0x8f, 0x9f, 0xcf, 0xdf, 0xef, 0xff] { // (the ops fm1-isa decodes)
             cases.push(Fast::FOp { d: 0, a: 1, b: 2, op: fop });
             cases.push(Fast::FOp { d: 0, a: 1, b: 1, op: fop });
         }
