@@ -27,7 +27,7 @@
 \title{\textbf{Emulating a Synthesizer Before It Arrives}\\[2pt]
 \large Recovering an undocumented CPU from its firmware and running the M-VAVE FM-1\\ in a browser}
 \author{Joakim Eriksson\\\small\url{https://github.com/joakimeriksson/fm1-emu}}
-\date{Technical report \quad\textperiodcentered\quad 13 October 2026 \quad\textperiodcentered\quad written before validation on hardware}
+\date{Technical report \quad\textperiodcentered\quad 13 October 2026, with Section~\ref{sec:hw} on the real hardware added 24 October and extended 26 October 2026}
 
 \begin{document}
 \maketitle
@@ -48,7 +48,12 @@ only if the emulated audio stayed byte-identical across three execution modes. T
 then used as the development platform for a new firmware, \emph{FM-1 SID}, which runs a Commodore~64
 tune's 6502 code and a reSID model of the SID chip on the FM-1's CPU. The work was done by one person
 directing an AI coding agent; the report closes with how that collaboration was organised and which
-rules made its output trustworthy.
+rules made its output trustworthy. A section added once the hardware arrived tells what releasing
+FM-1 SID before anyone had run it on an FM-1 cost its first users, and how it was made to work on the
+device in four rounds. Their tool is \emph{fm1-dock}, a host firmware installed once, through which
+synths are deployed and probes are run from RAM. The probes compare the emulator with the real FM-1,
+and their findings changed the emulator: CPU guards, LCD timing, a measured cycle and flash-cache
+model, and a survey of what 80 firmwares execute.
 \end{abstract}
 
 \section{Introduction}
@@ -452,6 +457,270 @@ from the sequencer tempo, the chip model, and an oscilloscope of the output.}
 \label{fig:fx}
 \end{figure}
 
+\section{Tuning towards the real hardware}
+\label{sec:hw}
+
+\paragraph{Released before it was tested.} FM-1 SID was offered for download as an FM-1 update
+package on 11 October, a day after the first community firmware ran on the emulator, and for a few
+days the community's firmware hub listed it beside firmwares that had run on real units. Nobody on
+the project owned an FM-1 yet. Eight days later, people who installed it found that it played but that their computers no longer
+saw the synth (GitHub issues \#22 and \#24, 19 October): FM-1 SID had no USB stack at all, and an
+FM-1 firmware is updated only through the firmware that is running, so no installer could reach it.
+The way back was found by the community, not by us: holding OCT$-$ and OCT$+$ together for about five
+seconds at power-on enters the chip's own update mode, below every firmware, from which a third-party
+flasher (M-flasher) wrote M-VAVE's stock firmware back. FM-1 SID was taken off the hub. No unit was
+damaged permanently, but each owner had to find and perform that recovery themselves.
+
+The emulator could not have caught this. It had no USB model then (one was added after the hardware
+arrived), and nothing in it asked whether a firmware can be replaced. The
+failure was one of process rather than emulation: a firmware that had never run on hardware was
+published as an install. The rule taken from it: what has not run on a real FM-1 is labelled so, and
+a package is offered only once it has run there, with its way back tested on the device.
+
+\paragraph{Round one: the emulator was not the device.} The FM-1 arrived on 23 October, and the
+first attempt to fix FM-1 SID on it was humbling. USB-MIDI was added, with three exits to the update
+mode (OCT$-$ and OCT$+$ held while running, two failed starts in a row, and the installers' upgrade
+command), and every check on the emulator passed. On the device, the synth mode played but no tune
+did, and the firmware received the installer's commands but none of its replies reached the
+computer. Getting the unit back took three recoveries through the chip's mask-ROM mode, for which no
+macOS tool exists (a Linux machine and MvaveFM1Unbricker). The question was no longer ``is the
+emulator consistent?'' but ``where does it differ from the chip?''.
+
+\paragraph{fm1-dock: install once, then deploy and measure.} The day after the first reports of stuck
+units, three days before the hardware arrived, the author asked whether the risk could be removed at its
+source: a thin resident layer, installed once, through which experimental synths are deployed and
+inspected without a full firmware upgrade each time. That layer was built on the emulator as
+\emph{harbor} and renamed \emph{fm1-dock} when it was released. It is a host firmware, grown from
+zvenson's Dinghy, that owns everything a broken experiment must not take down: USB-MIDI, the
+installers' protocol, the USB rescue (OCT$-$ at power-on), the screen and the keys. Over its own
+SysEx commands it accepts three kinds of code. A \emph{module} is a synth, compiled against a small
+host interface, written into a flash slot fm1-dock reserves for it (a deploy takes about ten
+seconds, erases only that slot, and can be undone by deleting the module), and picked with HOME.
+A \emph{probe} is a program relocated into RAM and run once; nothing is written to flash. A file sent
+to the running module's \code{data()} hook (the MODULE command) is how FM-1 SID 0.3 plays a tune sent
+over USB, straight into its emulated C64's memory. The emulator speaks the same protocol over an
+emulated USB device, so every tool runs unchanged against either machine.
+
+\paragraph{Measuring instead of guessing.} The probes were what answered the question. A probe writes
+typed records (numbers, words, TIMER4 timings with the interrupts off and an empty loop subtracted)
+into a buffer in memory that survives a reset, so a probe that crashes still reports how far it got
+and where. The same probe runs on the FM-1 and on the emulator (\code{tools/probe.py run X.c --on
+emu,fm1}), and the two results are printed side by side with the ratio of every timing. A new
+question about the hardware costs a C file of a few dozen lines and a few seconds, not a firmware
+install and a risk to the unit; Table~\ref{tab:probes} lists the questions asked in the first two
+days.
+
+The first probe found the first gap. Every probe crashed on the device on its second instruction,
+at the same addresses each time, while the emulator ran them happily. Reading the crash record
+(another probe, a memory dump) showed the CPU exception with cause bit~12 of the debug unit: the
+\emph{PC limit}. Dinghy's start-up code, inherited from Felucca, arms the core's guards: instruction
+fetches are allowed only within the firmware's own code and its RAM routines, writes into the stack
+guard bands and the vector area trap, and so do accesses to unmapped space. The emulator modelled
+none of this. With the guards modelled (the limit registers kept, a block fetched outside both
+windows ends a run, the instruction executes and interrupt~1 is raised with the cause set), the
+emulator crashed the same probes at exactly the device's addresses, \code{0x01C301A2} and
+\code{0x01C301BA}. With fm1-dock widening the PC limits around a probe, both ran: the first program
+loaded and run from RAM on a real FM-1.
+
+\paragraph{What the probes measured.} Table~\ref{tab:hw} lists the gaps found, each turned into an
+emulator change and a test. Three of them explained FM-1 SID's failure on the device. The emulator
+finished LCD transfers at once, while the real SPI clock is about 11\,MHz: FM-1 SID redrew the whole
+screen (115\,KB, $\approx$82\,ms) every 40\,ms and waited for it, which starved the main loop that
+runs the tune ahead of the audio interrupt. With timed LCD transfers the emulator reproduced the
+silence (peak level 112 instead of 9\,086) and now warns when the screen takes most of the time.
+The second was speed: the emulator charged one 240\,MHz cycle per instruction, but FM-1 SID's own
+load meter read 24\,\% on the device against 13\,\% on the emulator. Emulated at 130\,MHz, the
+emulator reproduced the device exactly (GoatTracker songs played, an RSID tune went silent), and
+the cause was a firmware bug that only a slow enough CPU exposes: once the play routine fell behind
+the audio interrupt, an unsigned \code{gen\_cyc - play\_cyc} wrapped and generation stopped for
+good. The third, the installer that never answered, is still not explained; one plausible theory
+(the \code{idle} instruction in the main loop) was refuted by a probe that sent 40 MIDI notes over
+USB between \code{idle}s and saw all 40 arrive.
+
+\begin{table}[t]
+\centering\footnotesize
+\begin{tabularx}{\textwidth}{@{}>{\raggedright}p{36mm}X>{\raggedright\arraybackslash}p{36mm}@{}}
+\toprule
+Gap & On the FM-1 & In the emulator now\\
+\midrule
+LCD transfer time & SPI $\approx$11.2\,MHz; a full frame $\approx$82\,ms & timed at 12\,MHz; a warning when the screen dominates\\
+PC limit, bus guard & a fetch outside the limits, or a NULL-page access, raises the exception & modelled, cause bits in \code{DBG\_MSG}\\
+Misaligned 16/32-bit RAM access & faults (\code{EMU\_MSG} bit 0, always on); flash reads across bytes & faults in strict mode\\
+Instruction cost & 0.58--6.75 cycles by class (Table~\ref{tab:cyc}) & per-class costs in strict mode\\
+Flash cache & 32\,KB, 64-byte lines, $\approx$300 cycles a miss & modelled in strict mode\\
+TIMER4 & 24\,MHz to 51\,ppm against the host's USB frames & as assumed\\
+\code{trigger} (fault stub) & freezes the trace unit & a no-op (was ``unsupported'')\\
+\bottomrule
+\end{tabularx}
+\caption{Differences between the emulator and the FM-1 found with probes, and what was done.}
+\label{tab:hw}
+\end{table}
+
+\paragraph{A cycle model.} A probe with one instruction per statement (inline assembly, eight per
+loop round) gave the cost of each instruction class on the device (Table~\ref{tab:cyc}). The core is
+fast at straight-line arithmetic, which it issues two at a time, and slow at control flow: a taken
+branch costs five to six cycles, a call and return ten. A second probe swept the footprint and stride
+of flash reads: a footprint up to 32\,KB hits, 64\,KB misses; the cost doubles with the stride up to
+64 bytes; a miss costs about 1.3\,\textmu s. These numbers became a \emph{strict} mode
+(\code{FM1\_STRICT=1}): the interpreter only, a clock in eighths of a cycle, each instruction its
+measured cost (taken and not-taken branches apart), a 32\,KB, 64-byte-line cache in front of flash
+for data and code, and misaligned accesses faulting. In strict mode FM-1 SID's load meter reads
+21\,\% (device 24\,\%, fast mode 13\,\%), every class of Table~\ref{tab:cyc} but the load-use stall
+is within about 10\,\% of the device (a store followed by a load of the same word, and independent
+multiplies, are not modelled either), and the firmware build that failed on the device fails the
+same way. The fast modes still count one cycle per instruction: changing the three
+compilers' accounting is left for later.
+
+\begin{table}[t]
+\centering\footnotesize
+\begin{tabular}{@{}lrrlrr@{}}
+\toprule
+Instruction class & FM-1 & strict & Instruction class & FM-1 & strict\\
+\midrule
+\code{nop}, \code{and}, add & 0.58--0.75 & 0.62 & load word / half / byte & 1.25--1.34 & 1.25\\
+6-byte constant & 1.08 & 1.12 & store & 1.42 & 1.45\\
+multiply & 1.92 & 1.88 & push + pop of 4 registers & 10.6 & 10.5\\
+divide & 6.75 & 6.78 & \code{goto} & 5.17 & 5.25\\
+branch, not taken & 0.85 & 0.88 & branch, taken & 6.50 & 6.50\\
+call + return & 10.2 & 10.0 & load feeding a load & 3.08 & 1.25\\
+\bottomrule
+\end{tabular}
+\caption{Cycles (240\,MHz) per instruction measured on the FM-1 (\code{probes/cycles.c}, run from
+RAM) and charged by the emulator's strict mode. The load-use stall in the last row is not modelled
+yet.}
+\label{tab:cyc}
+\end{table}
+
+\paragraph{DSP, the FPU, and what the community uses.} The same method looked at the core's DSP-style
+instructions. Halfword multiply-accumulates with saturation cost 1.2 cycles on the device, three times
+less than the 64-bit multiply-accumulate chain the compiler emits for \code{acc += (int64\_t)a * b}
+(3.4 cycles); the saturating shift exposed as \code{\_\_builtin\_pi32v2\_qasl} clamps in 0.6 cycles; a
+cache line prefetch (\code{pfetch}) issued a microsecond ahead halves a miss. A probe of audio
+kernels, run on both machines with checksums of the output, showed that a biquad costs about 20
+cycles a sample in any form (32-bit, 64-bit MAC, halfword MAC, or single-precision float on the
+hardware FPU), and that a float state-variable filter is faster than its integer version; every
+checksum the emulator could compute matched the device's. The probe also exposed a limit of corpus
+mining: the halfword multiply-accumulate classes were fitted only for the register combinations the
+corpora contain, so the emulator cannot decode them with any others. Running all 80 published
+firmwares on the emulator with an executed-instruction histogram showed that none uses those
+instructions, a few use 64-bit multiplies, and 16 do a substantial part of their work on the FPU.
+
+The cost of a filter turned out not to lie in its arithmetic but in its loop: the taken branch that
+closes an iteration costs as much as six plain instructions. The core has hardware loops,
+\code{rep N rR \{ \ldots\ \}}, which no firmware's compiler emits (the 80 firmwares executed eight
+between them). Probes established three rules that no document states: the body is at most 32 bytes
+(the assembler counts it), the loop counts its register down to zero, and only counts up to 31 work
+(for 32 and above the device runs the count modulo 32, plus one, times; the emulator ran the full
+count, the one semantic error the probes found). Within those rules, a hardware loop with halfword
+multiply-accumulates runs a 64-tap FIR on 16-bit samples at 2.9 cycles a tap against 11 for the C
+loop, 3.9 times faster, with an identical result (Table~\ref{tab:dsp}): one channel at 44.1\,kHz goes
+from 13\,\% of the core to 3.4\,\%. The gain is in tight inner loops (FIR, multi-tap delays, mixing,
+gain); a biquad's body does not fit 32 bytes. One hoped-for gain did not exist: the emulator's map has
+a 512\,KB ``overlay'' bank at \code{0x04000000} and 256\,KB at \code{0x01F00000}, guessed on day one, but
+on the device the first hangs the bus, the second faults (the stock start-up clears 16\,KB there after
+writing cache control registers: most likely the cache's own memory), and so does anything past the
+512\,KB of main RAM.
+
+\begin{table}[t]
+\centering\footnotesize
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Kernel (on the FM-1) & C & hardware loop + DSP & speed-up\\
+\midrule
+loop overhead (a load and an add an iteration) & 6.75 & 2.38 & 2.8$\times$\\
+64-tap FIR, per tap (C with a 64-bit accumulator: 9.78) & 11.06 & 2.86 & 3.9$\times$\\
+block gain with a clamp, per sample & 12.81 & 5.70 & 2.2$\times$\\
+\bottomrule
+\end{tabular}
+\caption{Cycles on the FM-1 (\code{probes/dspx2.c}): C as the vendor compiler builds it, against
+inline assembly with a hardware loop (\code{rep}), halfword multiply-accumulates with saturation and
+the saturating shift. Every fast version gives the C version's result.}
+\label{tab:dsp}
+\end{table}
+
+\begin{table}[t]
+\centering\footnotesize
+\begin{tabularx}{\textwidth}{@{}>{\raggedright}p{50mm}X@{}}
+\toprule
+Question (probe) & Answer on the FM-1\\
+\midrule
+Does code run from RAM? (the first probe) & No: it faults on its second instruction (the PC limit); it runs once fm1-dock widens the limits\\
+Does \code{idle} in a main loop stop USB? (\code{idle}) & No: 40 of 40 MIDI notes sent between \code{idle}s, each $\leq$93\,\textmu s\\
+Must a USB transmit buffer be 8-byte aligned? (\code{usbtxoff.c}) & No: fm1-dock's driver sends from offsets 4 and 12, although that rule fitted all six failed FM-1 SID builds in the emulator\\
+Can a probe drive a USB endpoint itself? & Not safely: the computer stopped collecting from the FM-1 until a replug; probes send through fm1-dock\\
+Misaligned 16/32-bit RAM access (\code{align}) & Faults, always\\
+LCD SPI clock (\code{lcd}) & $\approx$11.2\,MHz: a full frame takes $\approx$82\,ms\\
+TIMER4 against the computer's USB frames (\code{clock}) & 24\,MHz within 51\,ppm\\
+Instruction costs (\code{cycles.c}) & 0.58--10.6 cycles by class (Table~\ref{tab:cyc})\\
+Flash cache (\code{cache.c}) & 32\,KB, 64-byte lines, $\approx$300 cycles a miss\\
+Hardware loops, DSP instructions (\code{dspx2.c}) & body $\leq$32 bytes, counts $\leq$31; FIR 3.9$\times$ faster (Table~\ref{tab:dsp})\\
+Memory banks mapped since day one & \code{0x04000000} hangs the bus, \code{0x01F00000} faults\\
+\bottomrule
+\end{tabularx}
+\caption{Questions answered by probes run from RAM through fm1-dock on 24--25 October. Each took a
+C file and seconds on the device; none wrote flash.}
+\label{tab:probes}
+\end{table}
+
+\paragraph{Round two: let the host own USB.} The probes refuted the two theories for FM-1 SID's silent
+USB: \code{idle} was not it, and neither was buffer alignment, although an emulator rule requiring it
+reproduced every failed build. A rule fitted to past failures is not evidence until the chip agrees.
+Rather than keep hunting the bug in FM-1 SID's own USB code, FM-1 SID was rebuilt as an fm1-dock
+module, so that fm1-dock answers the installers whatever the module does. The probes' findings went
+in at the same time: the screen sends only the rows that changed, a strip at a time with the tune fed
+between strips; a play routine that falls behind catches up instead of stopping; and the
+cycle-stepped 6502 core gave way to one that runs an instruction per dispatch with each memory access
+at its cycle, fast enough for the slower real CPU (PSID output bit-identical, RSID checked against
+libsidplayfp). Deployed the same day, it played on the device and USB answered while it played.
+
+\paragraph{Round three: the safety net is hardware too.} The standalone FM-1 SID was then deployed into
+a developer feature of fm1-dock, a \emph{boot slot} that fm1-dock hands the FM-1 to at power-on, to
+study its USB bug on the chip. Two flaws made it a trap. fm1-dock decided to hand over by comparing
+names, and the boot firmware had the same name as the selected module. And the escape keys were read
+only in the first 50\,ms after power-on, which the emulator honoured and the device did not. Every
+start handed over to the firmware whose USB was broken, and the unit needed a fourth recovery from
+Linux. The fixes: release builds have no boot slot at all (a boot firmware is refused, an old entry is
+forgotten at start-up), the power-on keys are read for 500\,ms, and OCT$-$ is read again while
+fm1-dock starts. The lesson is the section's in miniature: a rescue path is hardware behaviour, and
+it is not proven until it has been taken on the device.
+
+\paragraph{Round four: released, verified on the device.} On 25 October FM-1 SID 0.2 shipped as a
+solo firmware built on fm1-dock: one module, with fm1-dock's USB, installer protocol and rescue
+underneath. It was installed with a community installer and played with the heaviest audio block at
+34\,\% of its time and no overruns, while the installers reached it over USB. The same evening
+fm1-dock 0.6 and FM-1 SID 0.3 added two features that need the device and the browser together: any
+SID tune picked on the web page is sent over USB into FM-1 SID's emulated C64 memory and plays at once
+(Commando in 1.6\,s, nothing written to flash), and the FM-1's keys go out as MIDI notes, so the real
+FM-1 plays the emulated one in the browser. Table~\ref{tab:rounds} summarises the rounds.
+
+\begin{table}[t]
+\centering\footnotesize
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright}p{52mm}X>{\raggedright\arraybackslash}p{24mm}@{}}
+\toprule
+Date & Change & On the FM-1 & Recoveries\\
+\midrule
+11--19 Oct & FM-1 SID package, tested on the emulator only; no USB & plays; no computer sees it & owners, chip's mode + M-flasher\\
+23 Oct & USB-MIDI, three exits to the update mode & tunes silent; installer replies never arrive & 3, from Linux\\
+24 Oct & probes on fm1-dock; screen strips, catch-up, a faster 6502 core; FM-1 SID as a module & plays; USB answers while it plays & --\\
+25 Oct & the standalone in fm1-dock's boot slot, to study its USB & escape keys missed; handed over at every start & 1, from Linux\\
+25 Oct & no boot slot in releases, longer key reads; FM-1 SID 0.2 as a solo app & heaviest block 34\,\%, no overruns; installers answer & --\\
+25 Oct & fm1-dock 0.6, FM-1 SID 0.3: tunes over USB, keys as MIDI & a tune from the page plays on the device in 1.6\,s & --\\
+\bottomrule
+\end{tabularx}
+\caption{FM-1 SID from its first release to one verified on the device.}
+\label{tab:rounds}
+\end{table}
+
+\paragraph{What changed.} The emulator was right about almost everything that its oracles could
+reach: of everything the probes tested, one instruction's semantics needed correcting (the hardware
+loop's count), and every kernel it could run gave the device's output. It was wrong about what no
+oracle covered: timing, caches, and the protections a start-up file switches
+on. Those are exactly the things a vendor disassembler and a compiler's constant folder cannot know,
+and a day of probes on the device measured them. The rule we take from it is the one
+the probe tool makes cheap: a claim about the hardware is a measurement, and a firmware is not ready
+for the device because it passes on the emulator, but because the emulator has been shown to fail
+the way the device fails.
+
 \section{How the work was organised}
 
 \begin{table}[t]
@@ -465,9 +734,12 @@ Day & Result\\
 3 (Oct 10) & Interrupts, timers, flash, LCD, I2S, keys: Felucca plays; live at 240\,MHz with the AArch64 JIT; fifteen firmwares, the FPU, the browser build, published.\\
 4 (Oct 11) & Flags and carry; stock firmware with both cores; SID study, player firmware, HVSC page, synth mode, update package, sequencer; WebAssembly JIT.\\
 5 (Oct 12) & MIDI in; a guide on the page; own repository; FM-1 SID boots as a synth, with effects.\\
+Oct 19--20 & Users who installed FM-1 SID cannot reach their FM-1 over USB; the community finds the way back. The idea of a host to deploy synths into.\\
+Oct 23--24 & The FM-1 on the desk: FM-1 SID fails on it; fm1-dock and probes over USB-MIDI; guards, timed LCD, a cycle and flash-cache model; FM-1 SID as an fm1-dock module (Section~\ref{sec:hw}).\\
+Oct 25 & A boot-slot trap and its fixes; fm1-dock 0.6 and FM-1 SID 0.2 and 0.3 released, verified on the device.\\
 \bottomrule
 \end{tabularx}
-\caption{Timeline. The repository has 38 commits; each is a working state that passed the checks.}
+\caption{Timeline. Each commit is a working state that passed the checks.}
 \label{tab:time}
 \end{table}
 
@@ -499,17 +771,31 @@ turned claims into checks:
 \item \textbf{State what is unverified.} Statements not yet checked on hardware (the stock MIDI
   channel, FM-1 SID on a real unit, which instructions set flags) are marked as such in the
   documentation and on the pages.
+\item \textbf{The device decides, and the way back comes first.} Learned late, from FM-1 SID's first
+  users (Section~\ref{sec:hw}): an emulator pass makes a firmware a candidate, not a release. Nothing
+  is offered for install before it has run on a real FM-1, and nothing risky goes onto the unit
+  before its way back has been taken on the chip itself. Installs on the unit are run by the human;
+  the agent may read from the device (identity, logs) and run probes, which never write flash.
 \end{itemize}
 
 \section{Limitations}
 
-Nothing here has yet been compared with a real FM-1. Instruction timing is one cycle per instruction
-except where peripherals impose waits; flash wait states and divide latency are not modelled.
-Which instructions update flags on the real core is assumed from compiled code, which only reads
-them right after a producer. Two FPU operations in the stock firmware (codes 7 and 8) are unknown.
-The real entry chain of core 1 is not understood; the emulator starts it at the address the
-firmware writes. These are the first things to test once the hardware arrives: running the
-differential probes on the device would turn the emulator's assumptions into measurements.
+Section~\ref{sec:hw} compares the emulator with a real FM-1, but only in part. Instruction costs and
+the flash cache are modelled in the strict mode only; the fast modes still charge one cycle per
+instruction, and load-use and store-to-load stalls, sequential prefetch and a possible split of the
+cache between code and data are not modelled. The write and stack limits of the guards are not
+modelled, and misaligned accesses fault only in the strict mode. Why the standalone FM-1 SID builds never
+answered an installer on the device is not explained; FM-1 SID avoids the question by leaving USB to
+fm1-dock. In the emulator about one USB command frame in 80 is lost after the device has accepted
+its packets, so the senders repeat a frame after a second; whether the device does the same is not
+measured. Which instructions update flags on the real
+core is still assumed from compiled code, which only reads them right after a producer. Two FPU
+operations in the stock firmware (codes 7 and 8) are unknown, the halfword multiply-accumulate
+classes decode only for the register combinations seen in the corpora (656 classes in all have no
+solved operand fields), the hardware loop still runs counts of 32 and more in full, the two memory
+banks that do not exist on the device are still mapped, and the real entry chain of
+core 1 is not understood; the emulator starts it at the address the firmware writes. Each of these
+is now a probe away from a measurement.
 
 \section{Conclusion}
 
