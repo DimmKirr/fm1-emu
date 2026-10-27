@@ -308,7 +308,8 @@ toolchain. On top of the CPU sit models of the chip's timers, interrupts, flash,
 Hot code is compiled, to AArch64 natively and to WebAssembly in the browser.
 How it was built and checked, step by step, is told in a technical report:
 [Emulating a Synthesizer Before It Arrives](https://joakimeriksson.github.io/fm1-emu/fm1-emu-report.pdf)
-(PDF, 8 pages).
+(PDF, 12 pages), with a section on the real FM-1: what releasing FM-1 SID before it ran on one cost
+its first users, the rounds that made it work there, and what fm1-dock's probes measured on the chip.
 
 - `crates/`: `fm1-isa` (decoder tables), `fm1-core` (CPU and JITs), `fm1-soc` (the chip and
   the board), `fm1-live` (the native synth), `fm1-emu` (batch runner), `fm1-web` (the wasm
