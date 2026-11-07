@@ -40,6 +40,9 @@ mod ram;
 pub mod smk;
 mod spiflash;
 pub mod usb;
+pub mod nat;
+pub mod net;
+pub mod wifi_hw;
 
 pub use lcd::{write_bmp, Lcd};
 pub use periph::{Action, Periph, CPU_HZ, VEC_BASE};
@@ -375,6 +378,10 @@ pub struct Soc {
     pub hwsrc: hwsrc::HwSrc,
     /// USB0 and, with a cable (`usb_plug`), a host on the other end (usb.rs).
     pub usb: usb::Usb,
+    /// Hardware-level WiFi emulation for clean-room drivers (wifi_hw.rs): the WDMA
+    /// engine, the BBP port and MAC registers at 0x30000, a virtual AP and the virtual
+    /// subnet behind it. `enable_oss_wifi` turns it on; None = no WiFi chip.
+    pub wifi_hw: Option<wifi_hw::WifiHw>,
     /// Exact skipping of cpu0's polling loops (`machine::run_blocks`).
     pub loop_skip: machine::LoopSkip,
     /// Chip resets so far (the watchdog's, PR_PWR's: p33.rs), and the cause of one to come
@@ -548,6 +555,7 @@ impl Soc {
             hweq: hweq::HwEq::new(),
             hwsrc: Default::default(),
             usb: Default::default(),
+            wifi_hw: None,
             // (FM1_TRACE: a trace shows every instruction as it runs, not a probe's)
             loop_skip: machine::LoopSkip::new(std::env::var_os("FM1_NO_LOOPSKIP").is_none() && std::env::var_os("FM1_TRACE").is_none()),
             resets: 0,
@@ -717,6 +725,22 @@ impl Soc {
         }
     }
 
+    /// Hardware-level WiFi emulation (--oss-wifi): the WDMA engine, the BBP port and MAC
+    /// registers, and a virtual 802.11 AP bridged to the virtual subnet (wifi_hw.rs).
+    pub fn enable_oss_wifi(&mut self) {
+        self.wifi_hw = Some(wifi_hw::WifiHw::new());
+        self.periph.arm_wifi_tick();
+    }
+
+    /// The real network behind the WiFi chip's virtual AP (--internet; after
+    /// `enable_oss_wifi`). Off by default: a firmware reaches nothing outside the
+    /// emulator. `allow_lan`: this computer's own addresses and its LAN too.
+    pub fn enable_internet(&mut self, allow_lan: bool) {
+        if let Some(hw) = self.wifi_hw.as_mut() {
+            hw.vnet.enable_nat(allow_lan);
+        }
+    }
+
     /// Wire the chip into `board`'s panel (and its flash chip's id).
     pub fn set_board(&mut self, board: Board) {
         self.board = board;
@@ -734,6 +758,13 @@ impl Soc {
         let due = self.periph.advance(n);
         if due.wdt {
             self.reset_req.get_or_insert(p33::P33::RST_WDT);
+        }
+        if due.wifi_tick {
+            // the WiFi chip's 10 ms: beacons on the air, the NAT's sockets, frames into RAM
+            let ms = self.periph.ms();
+            if let Some(hw) = self.wifi_hw.as_mut() {
+                hw.tick(ms, &mut self.ram);
+            }
         }
         if let Some((at, b)) = due.uart_rx {
             self.write8(at, b);
@@ -1261,6 +1292,17 @@ impl Bus for Soc {
 impl Soc {
     #[inline(never)]
     fn read32_slow(&mut self, addr: u32) -> u32 {
+        // --oss-wifi: the WiFi DMA, the wireless control block, the BBP port and the MAC
+        // registers (everything else at 0x30000+ stays unknown)
+        if let Some(hw) = self.wifi_hw.as_mut() {
+            match addr {
+                0x40200..=0x4029C => return hw.dma_read(addr - 0x40000),
+                0x14028..=0x1405C => return hw.wl_ctrl_read(addr),
+                0x3101C => return hw.bbp_read(addr - 0x30000),
+                0x30120..=0x3ffff => return hw.mac_read(addr - 0x30000),
+                _ => {}
+            }
+        }
         match self.region(addr) {
             Region::Xip => {
                 let o = (addr - XIP_BASE) as usize;
@@ -1300,7 +1342,19 @@ impl Soc {
             // (a trim only nudges the DAC's DC offset).
             Region::Ana => {
                 let v = self.sfr_get(addr);
-                if addr == 0x11978 { (v & !0xff00) | 0x4_0000 | 0x8000 | 0x20 } else { v }
+                if addr == 0x11978 {
+                    // --oss-wifi: the driver's VCO scan sets CAL_START (0x11968 bit 28) and
+                    // reads the comparator here; "locked" (neither bit 17 nor 18) ends its
+                    // binary search at once
+                    if self.wifi_hw.is_some() && self.sfr_get(0x11968) & (1 << 28) != 0 {
+                        let cal = self.sfr_get(0x11968) & !(1 << 28);
+                        self.sfr_set(0x11968, cal);
+                        return 0;
+                    }
+                    (v & !0xff00) | 0x4_0000 | 0x8000 | 0x20
+                } else {
+                    v
+                }
             }
             // the Bluetooth baseband (bsfr 0x20000; no radio here): reads 0, writes are
             // dropped (self-clearing requests like bt_clkn_compare_arm's capture at 0x2001C
@@ -1392,6 +1446,17 @@ impl Soc {
 
     #[inline(never)]
     fn write32_slow(&mut self, addr: u32, value: u32) {
+        // --oss-wifi: as read32_slow
+        if let Some(hw) = self.wifi_hw.as_mut() {
+            match addr {
+                // (the DMA reads descriptors and frames out of RAM)
+                0x40200..=0x4029C => return hw.dma_write(addr - 0x40000, value, &mut self.ram),
+                0x14028..=0x1405C => return hw.wl_ctrl_write(addr, value),
+                0x3101C => return hw.bbp_write(addr - 0x30000, value),
+                0x30120..=0x3ffff => return hw.mac_write(addr - 0x30000, value, &mut self.ram),
+                _ => {}
+            }
+        }
         match self.region(addr) {
             Region::Xip | Region::XipFlash => self.log_unknown(addr, 4, true, value), // flash writes go via the ROM
             Region::Ram => self.ram.write32(addr - RAM_BASE, value),
@@ -1897,6 +1962,36 @@ mod tests {
         soc.write32(0x11d0c, RAM_BASE);
         soc.write32(0x11d10, 0x800);
         assert_eq!(soc.read32(0x11d00) & 0x8000, 0, "the DMA is still on the wire");
+    }
+
+    #[test]
+    fn oss_wifi_wireless_ctrl_roundtrip() {
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        soc.enable_oss_wifi();
+        soc.write32(0x14040, 0x01);
+        assert_eq!(soc.read32(0x14040), 0x01);
+        soc.write32(0x1405C, 0x01);
+        assert_eq!(soc.read32(0x1405C), 0x01);
+    }
+
+    #[test]
+    fn oss_wifi_mac_registers() {
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        soc.enable_oss_wifi();
+        // MAC configuration registers (0x30120 and up) round-trip
+        soc.write32(0x30308, 0xDEAD);
+        assert_eq!(soc.read32(0x30308), 0xDEAD);
+        soc.write32(0x30F00, 0xBEEF);
+        assert_eq!(soc.read32(0x30F00), 0xBEEF);
+    }
+
+    #[test]
+    fn wifi_window_is_unknown_without_oss_wifi() {
+        // no WiFi chip: the whole 0x30000 window is an unknown access, logged, reading 0
+        let mut soc = Soc::new(1 << 16, vec![0; 0x1000]);
+        soc.write32(0x30308, 0xDEAD);
+        assert_eq!(soc.read32(0x30308), 0);
+        assert!(soc.unknown_log.iter().any(|u| u.addr == 0x30308));
     }
 }
 
