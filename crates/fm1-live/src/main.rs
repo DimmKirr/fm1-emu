@@ -112,6 +112,8 @@ struct Opts {
     internet: bool,
     /// --allow-lan: with --internet, this computer's own addresses and its LAN too
     allow_lan: bool,
+    /// --theme NAME: the panel color theme (default, cool-gray, black, orange, black-green, purple, white-blue)
+    theme: String,
 }
 
 /// The firmware catalog web/firmwares.json as (id, name, version, package path): each package is
@@ -153,7 +155,7 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        record: None, lcd_only: false, name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
                        flaky_core1: None, cpu1_survives: false, seed: None, flash: None, usb: false, oss_wifi: false,
-                       internet: false, allow_lan: false };
+                       internet: false, allow_lan: false, theme: "default".into() };
     let mut i = 1;
     while i < a.len() {
         if a[i] == "--usb" {
@@ -219,6 +221,7 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
             "--cpu1-survives" => { o.cpu1_survives = true; i -= 1; }
             "--flash" => o.flash = Some(a.get(i + 1)?.clone()),
             "--record" => o.record = Some(a.get(i + 1)?.clone()),
+            "--theme" => o.theme = a.get(i + 1)?.clone(),
             _ => return None,
         }
         i += 2;
@@ -374,7 +377,7 @@ fn high_priority() {
     }
 }
 
-fn bench(o: &Opts, ms: u64) {
+fn bench(o: &Opts, ms: u64, theme: &'static panel::Theme) {
     let mut m = match Machine::new(o) {
         Ok(m) => m,
         Err(e) => { eprintln!("cannot read {}: {e}", o.bin); std::process::exit(1); },
@@ -418,7 +421,7 @@ fn bench(o: &Opts, ms: u64) {
             while m.soc.periph.ms() >= next_frame {
                 let leds = m.soc.periph.led_take();
                 let down = m.soc.periph.keys_down;
-                if let Err(e) = write_panel(&mut m, &down, &leds, &format!("{dir}/{nframes:06}.ppm")) {
+                if let Err(e) = write_panel(&mut m, &down, &leds, &format!("{dir}/{nframes:06}.ppm"), theme) {
                     eprintln!("{dir}: {e}");
                     std::process::exit(1);
                 }
@@ -511,7 +514,7 @@ fn bench(o: &Opts, ms: u64) {
     dump_ram(&mut m);
     if let Ok(path) = std::env::var("FM1_BENCH_PANEL") {
         let leds = m.soc.periph.led_take();
-        match write_panel(&mut m, &[false; 41], &leds, &path) {
+        match write_panel(&mut m, &[false; 41], &leds, &path, theme) {
             Ok(()) => println!("panel at {} ms -> {path}", m.soc.periph.ms()),
             Err(e) => eprintln!("{path}: {e}"),
         }
@@ -675,7 +678,7 @@ enum RecSink {
 }
 
 impl Recorder {
-    fn new(target: &str, lcd_only: bool, board: fm1_soc::Board) -> std::io::Result<Self> {
+    fn new(target: &str, lcd_only: bool, board: fm1_soc::Board, theme: &panel::Theme) -> std::io::Result<Self> {
         let (sink, audio_path) = if target == "-" {
             std::fs::create_dir_all("work")?;
             (RecSink::Stream(Box::new(std::io::BufWriter::new(std::io::stdout()))), "work/audio.raw".to_string())
@@ -684,7 +687,7 @@ impl Recorder {
             (RecSink::Dir(target.to_string()), format!("{target}/audio.raw"))
         };
         let audio = std::io::BufWriter::new(std::fs::File::create(&audio_path)?);
-        let (base, w, h) = panel_base(board);
+        let (base, w, h) = panel_base(board, theme);
         Ok(Self { sink, audio, audio_path, lcd_only, frame: 0, next_ms: 0, buf: vec![0; w * h], base, w, h })
     }
 
@@ -716,21 +719,21 @@ fn leading_silence(frames: u64, samples: usize) -> usize {
 
 /// One frame: the panel with the keys the script holds (the SMK-37: its own keys and LEDs),
 /// or the LCD alone. The audio stays in the machine until the end (Recorder::finish).
-fn record_frame(m: &mut Machine, rec: &mut Recorder) {
+fn record_frame(m: &mut Machine, rec: &mut Recorder, theme: &panel::Theme) {
     let leds = m.soc.periph.led_take();
     let smk_leds = m.soc.periph.smk.led_take();
-    record_frame_leds(m, rec, &leds, &smk_leds);
+    record_frame_leds(m, rec, &leds, &smk_leds, theme);
 }
 
 /// `record_frame` with the LEDs' on-fractions given: the tail's frames peek at them, leaving
 /// the window to the final panel.
-fn record_frame_leds(m: &Machine, rec: &mut Recorder, leds: &[f32; 41], smk_leds: &[f32; fm1_soc::smk::NLED]) {
+fn record_frame_leds(m: &Machine, rec: &mut Recorder, leds: &[f32; 41], smk_leds: &[f32; fm1_soc::smk::NLED], theme: &panel::Theme) {
     use std::io::Write;
     let ppm = if rec.lcd_only {
         lcd_ppm(&m.soc.lcd.fb)
     } else {
         let down = m.soc.periph.keys_down;
-        render_panel(m, &rec.base, &down, leds, smk_leds, &[0; 7], &mut rec.buf);
+        render_panel(m, &rec.base, &down, leds, smk_leds, &[0; 7], &mut rec.buf, theme);
         panel_ppm(&rec.buf, rec.w, rec.h)
     };
     match &mut rec.sink {
@@ -744,14 +747,14 @@ fn record_frame_leds(m: &Machine, rec: &mut Recorder, leds: &[f32; 41], smk_leds
 /// The last 40 ms of a shot, an instruction at a time: how many ran, and how many of them in
 /// ISRs. The frames due in them are recorded too; they peek at the LEDs' on-fractions, so the
 /// window the final panel reports stays the whole 40 ms.
-fn run_tail(m: &mut Machine, ms: u64, mut rec: Option<&mut Recorder>) -> Result<(u64, u64), String> {
+fn run_tail(m: &mut Machine, ms: u64, mut rec: Option<&mut Recorder>, theme: &panel::Theme) -> Result<(u64, u64), String> {
     let (mut in_isr, mut total) = (0u64, 0u64);
     while m.soc.periph.ms() < ms {
         if let Some(r) = rec.as_deref_mut() {
             if m.soc.periph.ms() >= r.next_ms {
                 let leds = m.soc.periph.led_peek();
                 let smk_leds = m.soc.periph.smk.led_peek();
-                record_frame_leds(m, r, &leds, &smk_leds);
+                record_frame_leds(m, r, &leds, &smk_leds, theme);
             }
         }
         m.run(1)?;
@@ -763,7 +766,7 @@ fn run_tail(m: &mut Machine, ms: u64, mut rec: Option<&mut Recorder>) -> Result<
     Ok((in_isr, total))
 }
 
-fn shot(o: &Opts, ms: u64) {
+fn shot(o: &Opts, ms: u64, theme: &'static panel::Theme) {
     if o.record.as_deref() == Some("-") {
         REPORTS_TO_STDERR.store(true, Ordering::Relaxed);
     }
@@ -799,7 +802,7 @@ fn shot(o: &Opts, ms: u64) {
     m.soc.periph.skip_idle = want_skip && skip_from == 0;
     let mut usb_sends = usb_script();
     let mut rec = o.record.as_deref().map(|target| {
-        Recorder::new(target, o.lcd_only, m.soc.board).unwrap_or_else(|e| {
+        Recorder::new(target, o.lcd_only, m.soc.board, theme).unwrap_or_else(|e| {
             eprintln!("--record {target}: {e}");
             std::process::exit(1);
         })
@@ -856,7 +859,7 @@ fn shot(o: &Opts, ms: u64) {
         usb_headless(&mut m, &mut usb_sends);
         if let Some(r) = &mut rec {
             if m.soc.periph.ms() >= r.next_ms {
-                record_frame(&mut m, r);
+                record_frame(&mut m, r, theme);
             }
         }
     }
@@ -871,7 +874,7 @@ fn shot(o: &Opts, ms: u64) {
     // (the LEDs' on-fractions from here: the last 40 ms, on either board, recorded or not)
     let _ = m.soc.periph.led_take();
     let _ = m.soc.periph.smk.led_take();
-    let (in_isr, total) = match run_tail(&mut m, ms, rec.as_mut()) {
+    let (in_isr, total) = match run_tail(&mut m, ms, rec.as_mut(), theme) {
         Ok(v) => v,
         Err(e) => {
             usb_audio_save(&m);
@@ -935,7 +938,7 @@ fn shot(o: &Opts, ms: u64) {
     let panel_res = if o.lcd_only {
         write_lcd(&m.soc.lcd.fb, panel_path)
     } else {
-        write_panel(&mut m, &down, &leds, panel_path)
+        write_panel(&mut m, &down, &leds, panel_path, theme)
     };
     match panel_res {
         Ok(()) => {
@@ -1112,8 +1115,8 @@ fn panel_ppm(buf: &[u32], w: usize, h: usize) -> Vec<u8> {
 }
 
 /// The board's panel art, rasterized, and its size.
-fn panel_base(board: fm1_soc::Board) -> (Vec<u32>, usize, usize) {
-    if board == fm1_soc::Board::Smk37 { (panel_smk::base(), panel_smk::W, panel_smk::H) } else { (panel::base(), W, H) }
+fn panel_base(board: fm1_soc::Board, theme: &panel::Theme) -> (Vec<u32>, usize, usize) {
+    if board == fm1_soc::Board::Smk37 { (panel_smk::base(), panel_smk::W, panel_smk::H) } else { (panel::base(theme), W, H) }
 }
 
 /// The LCD as the machine shows it now, as a PPM file.
@@ -1123,7 +1126,7 @@ fn write_lcd(fb: &[u16], path: &str) -> std::io::Result<()> {
 
 /// The panel as the machine shows it now over its art `base` into `buf`: keys `down` held,
 /// `leds` lit (the SMK-37: its own keys, and `smk_leds`), the encoders at `enc_clicks`.
-fn render_panel(m: &Machine, base: &[u32], down: &[bool; 41], leds: &[f32; 41], smk_leds: &[f32; fm1_soc::smk::NLED], enc_clicks: &[i32; 7], buf: &mut [u32]) {
+fn render_panel(m: &Machine, base: &[u32], down: &[bool; 41], leds: &[f32; 41], smk_leds: &[f32; fm1_soc::smk::NLED], enc_clicks: &[i32; 7], buf: &mut [u32], theme: &panel::Theme) {
     if m.soc.board == fm1_soc::Board::Smk37 {
         let p = &m.soc.periph.smk;
         let (pads, force, faders) = (p.pads, std::array::from_fn(|i| p.analog(i as u8)), std::array::from_fn(|i| p.analog(16 + i as u8)));
@@ -1144,19 +1147,19 @@ fn render_panel(m: &Machine, base: &[u32], down: &[bool; 41], leds: &[f32; 41], 
         panel_smk::draw(buf, base, &st);
     } else {
         let st = panel::State { lcd: &m.soc.lcd.fb, enc_clicks, pot: m.soc.periph.adc_value[4], down, leds, turning: &[0; 8] };
-        panel::draw(buf, base, &st);
+        panel::draw(buf, base, &st, theme);
     }
 }
 
 /// The panel as the machine shows it now, keys `down` held and `leds` lit, as a PPM file.
-fn write_panel(m: &mut Machine, down: &[bool; 41], leds: &[f32; 41], path: &str) -> std::io::Result<()> {
-    let (base, w, h) = panel_base(m.soc.board);
+fn write_panel(m: &mut Machine, down: &[bool; 41], leds: &[f32; 41], path: &str, theme: &panel::Theme) -> std::io::Result<()> {
+    let (base, w, h) = panel_base(m.soc.board, theme);
     let smk_leds = m.soc.periph.smk.led_take();
     if m.soc.board == fm1_soc::Board::Smk37 {
         println!("SMK-37 button LEDs: {}", smk_leds.iter().enumerate().filter(|(_, &f)| f > 0.01).map(|(k, f)| format!("{k}:{f:.2}")).collect::<Vec<_>>().join(" "));
     }
     let mut buf = vec![0u32; w * h];
-    render_panel(m, &base, down, leds, &smk_leds, &[0, 0, 0, 3, -2, 0, 5], &mut buf);
+    render_panel(m, &base, down, leds, &smk_leds, &[0, 0, 0, 3, -2, 0, 5], &mut buf, theme);
     std::fs::write(path, panel_ppm(&buf, w, h))
 }
 
@@ -1231,7 +1234,7 @@ const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package:
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
 options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE] [--usb]
-         [--flaky-core1 RATE [--seed N]] [--cpu1-survives] [--version] [--help]
+         [--theme NAME] [--flaky-core1 RATE [--seed N]] [--cpu1-survives] [--version] [--help]
          [--oss-wifi [--internet [--allow-lan]]]  the WiFi chip for a clean-room driver; the real
                       network behind its virtual AP (off by default); this computer and its LAN too
 headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
@@ -1291,15 +1294,16 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
+    let theme = panel::Theme::by_name(&o.theme);
     if let Some(ms) = o.shot {
-        return shot(&o, ms);
+        return shot(&o, ms, theme);
     }
     if let Some(ms) = o.bench {
         if std::env::var("FM1_BENCH_THREAD").is_ok() {
             let o2 = Opts { bin: o.bin.clone(), ..o };
-            return std::thread::spawn(move || { high_priority(); bench(&o2, ms) }).join().unwrap();
+            return std::thread::spawn(move || { high_priority(); bench(&o2, ms, theme) }).join().unwrap();
         }
-        return bench(&o, ms);
+        return bench(&o, ms, theme);
     }
     let mut m = match Machine::new(&o) {
         Ok(m) => m,
@@ -1429,7 +1433,7 @@ fn main() {
         }
     };
     win.set_target_fps(60);
-    let base = panel::base();
+    let base = panel::base(theme);
     let mut buf = vec![0u32; W * H];
     let mut down = [false; 41];
     let mut enc_clicks = [0i32; 7];
@@ -1574,7 +1578,7 @@ fn main() {
         {
             let fb = lcd.lock().unwrap();
             let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
-            panel::draw(&mut buf, &base, &st);
+            panel::draw(&mut buf, &base, &st, theme);
         }
         if win.update_with_buffer(&buf, W, H).is_err() {
             break;
@@ -1836,10 +1840,11 @@ mod tests {
         let at = m.soc.periph.cycle_of_ms(1500);
         m.soc.periph.script.push_back((at, Action::Key { id: 21, down: true }));
         let dir = std::env::temp_dir().join(format!("fm1-live-test-{}", std::process::id()));
-        let mut rec = Recorder::new(&dir.to_string_lossy(), false, m.soc.board).unwrap();
+        let theme = panel::Theme::by_name("default");
+        let mut rec = Recorder::new(&dir.to_string_lossy(), false, m.soc.board, theme).unwrap();
         while m.soc.periph.ms() < 1600 {
             if m.soc.periph.ms() >= rec.next_ms {
-                record_frame(&mut m, &mut rec);
+                record_frame(&mut m, &mut rec, theme);
             }
             m.run(100_000).unwrap();
         }
@@ -1863,16 +1868,17 @@ mod tests {
         let o = parse_args(args(&["--fwsc", fwsc, "--shot", "2000"])).unwrap();
         let mut m = Machine::new(&o).unwrap();
         let dir = std::env::temp_dir().join(format!("fm1-live-tail-{}", std::process::id()));
-        let mut rec = Recorder::new(&dir.to_string_lossy(), false, m.soc.board).unwrap();
+        let theme = panel::Theme::by_name("default");
+        let mut rec = Recorder::new(&dir.to_string_lossy(), false, m.soc.board, theme).unwrap();
         // shot()'s main loop stops 40 ms short; its tail runs the rest an instruction at a time
         while m.soc.periph.ms() + 40 < 2000 {
             if m.soc.periph.ms() >= rec.next_ms {
-                record_frame(&mut m, &mut rec);
+                record_frame(&mut m, &mut rec, theme);
             }
             m.run(100_000).unwrap();
         }
         let before = rec.frame;
-        run_tail(&mut m, 2000, Some(&mut rec)).unwrap();
+        run_tail(&mut m, 2000, Some(&mut rec), theme).unwrap();
         assert_eq!(rec.frame, 125, "frames every 16 ms up to 1984 ms ({before} before the tail)");
         assert!(dir.join("000124.ppm").exists());
         std::fs::remove_dir_all(&dir).unwrap();
