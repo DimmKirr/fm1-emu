@@ -167,8 +167,12 @@ fn handle_input(text: &str, m: &mut Machine) {
             }
         }
         Some("midi") => {
-            if let Some(b) = v.get("b").and_then(|v| v.as_u64()) {
-                m.soc.periph.script.push_back((cycle, Action::Midi { b: b as u8 }));
+            if let Some(data) = v.get("data").and_then(|v| v.as_array()) {
+                for b in data {
+                    if let Some(b) = b.as_u64() {
+                        m.soc.periph.script.push_back((cycle, Action::Midi { b: b as u8 }));
+                    }
+                }
             }
         }
         _ => {}

@@ -367,7 +367,7 @@ ws.close()
 
 Raw input events are also accepted as plain JSON (not wrapped in JSON-RPC):
 `{"type":"key","id":12,"down":true}`, `{"type":"enc","enc":3,"clicks":5}`,
-`{"type":"midi","b":144}`.
+`{"type":"midi","data":[0x90,60,100]}`.
 
 The page builds with `web/build.sh` (Rust to WebAssembly; needs the `wasm32-unknown-unknown`
 target), the whole site with `tools/build_site.sh`.
