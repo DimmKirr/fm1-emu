@@ -240,6 +240,7 @@ pub struct Periph {
     pub(crate) usb_period: u64,
     /// --oss-wifi: the WiFi chip's next tick, every 10 ms (`arm_wifi_tick`); MAX = no chip.
     pub(crate) wifi_next: u64,
+    pub(crate) usb_packet_next: u64,
     /// The cycle the watchdog runs out at (p33.rs; MAX: stopped).
     pub(crate) wdt_at: u64,
     tmr: [Tmr; 4],
@@ -391,6 +392,7 @@ impl Default for Periph {
             usb_next: u64::MAX,
             usb_period: 0,
             wifi_next: u64::MAX,
+            usb_packet_next: u64::MAX,
             wdt_at: u64::MAX,
             tmr: [Tmr { next: u64::MAX, ..Default::default() }; 4],
             uart: Uart { next: u64::MAX, ot_next: u64::MAX, ..Default::default() },
@@ -434,6 +436,7 @@ pub struct Due {
     pub uart_rx: Option<(u32, u8)>,
     /// A USB frame is due (the SoC runs the host's millisecond: usb.rs).
     pub usb_frame: bool,
+    pub usb_packet: bool,
     /// The watchdog ran out (the SoC resets the chip).
     pub wdt: bool,
     /// The WiFi chip's tick (--oss-wifi): the virtual AP's beacons, the NAT's sockets.
@@ -505,7 +508,7 @@ impl Periph {
     /// The next cycle at which something timed happens.
     fn next_event(&self) -> u64 {
         let mut n = self.t5_next.min(self.alnk_next).min(self.tick_next).min(self.spi2_next).min(self.adc_next).min(self.spi1_irq_at);
-        n = n.min(self.uart.next).min(self.uart.ot_next).min(self.usb_next).min(self.wdt_at).min(self.wifi_next);
+        n = n.min(self.uart.next).min(self.uart.ot_next).min(self.usb_next).min(self.usb_packet_next).min(self.wdt_at).min(self.wifi_next);
         for t in &self.tmr {
             n = n.min(t.next);
         }
@@ -598,6 +601,10 @@ impl Periph {
             due.wifi_tick = true;
             // (from the clock as it is now: the runner sets `hz` after the chip is made)
             self.wifi_next = self.cycles + (self.hz / 100).max(1);
+        }
+        if self.cycles >= self.usb_packet_next {
+            due.usb_packet = true;
+            self.usb_packet_next = u64::MAX;
         }
         if self.cycles >= self.wdt_at {
             self.wdt_at = u64::MAX;

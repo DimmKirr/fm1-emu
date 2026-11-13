@@ -117,6 +117,57 @@ struct Opts {
     theme: String,
     /// --cdp PORT: serve a thin HTML page + WebSocket for remote LCD + control
     cdp: Option<u16>,
+    usb_host: bool,
+    disk: Option<String>,
+}
+
+/// Unbuffered sector I/O: a completed write is already in the backing file.
+/// The advisory OS lock is held by this handle for the entire machine lifetime.
+struct DiskImage {
+    file: std::fs::File,
+    sectors: u32,
+}
+
+impl DiskImage {
+    fn open(path: &str) -> std::io::Result<Self> {
+        let open = || -> std::io::Result<Self> {
+            let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            file.try_lock().map_err(|e| std::io::Error::other(format!("exclusive disk lock: {e}")))?;
+            let metadata = file.metadata()?;
+            let size = metadata.len();
+            if !metadata.is_file() || size == 0 || size % 512 != 0 || size / 512 > u32::MAX as u64 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                    "disk must be a nonempty regular file of 512-byte sectors, at most 2 TiB minus 512 bytes"));
+            }
+            Ok(Self { file, sectors: (size / 512) as u32 })
+        };
+        open().map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))
+    }
+
+    fn seek_sector(&mut self, lba: u32) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        if lba >= self.sectors {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sector outside disk"));
+        }
+        self.file.seek(SeekFrom::Start(u64::from(lba) * 512))?;
+        Ok(())
+    }
+}
+
+impl fm1_soc::usb::SectorStorage for DiskImage {
+    fn sectors(&self) -> u32 { self.sectors }
+
+    fn read_sector(&mut self, lba: u32, data: &mut [u8; 512]) -> std::io::Result<()> {
+        use std::io::Read;
+        self.seek_sector(lba)?;
+        self.file.read_exact(data)
+    }
+
+    fn write_sector(&mut self, lba: u32, data: &[u8; 512]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.seek_sector(lba)?;
+        self.file.write_all(data)
+    }
 }
 
 /// The firmware catalog web/firmwares.json as (id, name, version, package path): each package is
@@ -145,6 +196,12 @@ fn parse() -> Option<Opts> {
 
 /// The options that only do something together: refused rather than ignored.
 fn check_opts(o: &Opts) -> Result<(), String> {
+    if o.usb && o.usb_host {
+        return Err("--usb / --usb-mode device conflicts with --usb-mode host".into());
+    }
+    if o.usb_host != o.disk.is_some() {
+        return Err("--usb-mode host requires --disk FILE; --disk requires host mode".into());
+    }
     if o.seed.is_some() && o.flaky_core1.is_none() {
         return Err("--seed needs --flaky-core1 (it seeds its misreads)".into());
     }
@@ -158,7 +215,8 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        record: None, lcd_only: false, name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
                        flaky_core1: None, cpu1_survives: false, seed: None, flash: None, usb: false, oss_wifi: false,
-                       internet: false, allow_lan: false, theme: "default".into(), cdp: None };
+                       internet: false, allow_lan: false, theme: "default".into(), cdp: None,
+                       usb_host: false, disk: None };
     let mut i = 1;
     while i < a.len() {
         if a[i] == "--usb" {
@@ -187,6 +245,12 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
             continue;
         }
         match a[i].as_str() {
+            "--usb-mode" => match a.get(i + 1)?.as_str() {
+                "device" => o.usb = true,
+                "host" => o.usb_host = true,
+                _ => return None,
+            },
+            "--disk" => o.disk = Some(a.get(i + 1)?.clone()),
             "--bin" => {
                 o.bin = a.get(i + 1)?.clone();
                 o.name = o.bin.rsplit('/').next().unwrap_or("").trim_end_matches(".bin").trim_end_matches(".xip").to_string();
@@ -252,6 +316,8 @@ struct Machine {
 
 impl Machine {
     fn new(o: &Opts) -> std::io::Result<Self> {
+        check_opts(o).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let disk = o.disk.as_deref().map(DiskImage::open).transpose()?;
         let stock = match &o.fwsc {
             Some(path) => {
                 let syx = o.syx.as_ref().map(std::fs::read).transpose()?;
@@ -318,6 +384,9 @@ impl Machine {
             }
         } else if o.internet {
             eprintln!("--internet: nothing to reach it through without --oss-wifi");
+        }
+        if let Some(disk) = disk {
+            soc.usb_disk(Box::new(disk));
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -1237,7 +1306,10 @@ const DRAG_PER_CLICK: f32 = 12.0;
 const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package: a community firmware, or M-VAVE's own)
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
-options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE] [--usb]
+options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE]
+         [--usb | --usb-mode device | --usb-mode host --disk FILE]
+         Disk images are opened writable without creation or truncation and exclusively locked.
+         Other tools must honor the advisory lock; do not mount or edit an image during a run.
          [--theme NAME] [--flaky-core1 RATE [--seed N]] [--cpu1-survives] [--version] [--help]
          [--oss-wifi [--internet [--allow-lan]]]  the WiFi chip for a clean-room driver; the real
                       network behind its virtual AP (off by default); this computer and its LAN too
@@ -1769,6 +1841,62 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usb_roles_are_exclusive_in_either_order() {
+        for a in [
+            vec!["--usb", "--usb-mode", "host", "--disk", "disk.img"],
+            vec!["--usb-mode", "host", "--disk", "disk.img", "--usb"],
+            vec!["--usb-mode", "device", "--usb-mode", "host", "--disk", "disk.img"],
+            vec!["--usb-mode", "host", "--disk", "disk.img", "--usb-mode", "device"],
+            vec!["--usb-mode", "host"], vec!["--disk", "disk.img"],
+            vec!["--usb-mode", "device", "--disk", "disk.img"],
+        ] {
+            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_err(), "{a:?}");
+        }
+        for a in [vec!["--usb"], vec!["--usb-mode", "device"],
+                  vec!["--usb-mode", "host", "--disk", "disk.img"]] {
+            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_ok());
+        }
+        for a in [vec!["--usb-mode", "bad"], vec!["--usb-mode"], vec!["--disk"]] {
+            assert!(parse_args(args(&a)).is_none());
+        }
+    }
+
+    #[test]
+    fn disk_image_is_exclusive_bounded_and_persistent() {
+        use fm1_soc::usb::SectorStorage;
+        let path = std::env::temp_dir().join(format!("fm1-usb-disk-{}.img", std::process::id()));
+        let name = path.to_str().unwrap();
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        file.set_len(1024).unwrap();
+        drop(file);
+        let mut disk = DiskImage::open(name).unwrap();
+        assert_eq!(disk.sectors(), 2);
+        assert!(DiskImage::open(name).is_err());
+        let first = [0xa5; 512];
+        let second = [0x3c; 512];
+        disk.write_sector(0, &first).unwrap();
+        disk.write_sector(1, &second).unwrap();
+        assert!(disk.write_sector(2, &first).is_err());
+        drop(disk);
+        let mut reopened = DiskImage::open(name).unwrap();
+        let mut read = [0; 512];
+        reopened.read_sector(0, &mut read).unwrap();
+        assert_eq!(read, first);
+        reopened.read_sector(1, &mut read).unwrap();
+        assert_eq!(read, second);
+        assert!(reopened.read_sector(u32::MAX, &mut read).is_err());
+        drop(reopened);
+        std::fs::write(&path, [0; 513]).unwrap();
+        assert!(DiskImage::open(name).is_err());
+        std::fs::write(&path, []).unwrap();
+        assert!(DiskImage::open(name).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let error = DiskImage::open(name).err().unwrap().to_string();
+        assert!(error.contains(name));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn rgb565_expands_to_the_full_range() {
