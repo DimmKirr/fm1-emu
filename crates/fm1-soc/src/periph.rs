@@ -238,6 +238,7 @@ pub struct Periph {
     /// USB frames (usb.rs): the next, and cycles per millisecond; MAX = no cable.
     pub(crate) usb_next: u64,
     pub(crate) usb_period: u64,
+    pub(crate) usb_packet_next: u64,
     /// The cycle the watchdog runs out at (p33.rs; MAX: stopped).
     pub(crate) wdt_at: u64,
     tmr: [Tmr; 4],
@@ -388,6 +389,7 @@ impl Default for Periph {
             spi2_next: u64::MAX,
             usb_next: u64::MAX,
             usb_period: 0,
+            usb_packet_next: u64::MAX,
             wdt_at: u64::MAX,
             tmr: [Tmr { next: u64::MAX, ..Default::default() }; 4],
             uart: Uart { next: u64::MAX, ot_next: u64::MAX, ..Default::default() },
@@ -431,6 +433,7 @@ pub struct Due {
     pub uart_rx: Option<(u32, u8)>,
     /// A USB frame is due (the SoC runs the host's millisecond: usb.rs).
     pub usb_frame: bool,
+    pub usb_packet: bool,
     /// The watchdog ran out (the SoC resets the chip).
     pub wdt: bool,
     pub actions: Vec<Action>,
@@ -494,7 +497,7 @@ impl Periph {
     /// The next cycle at which something timed happens.
     fn next_event(&self) -> u64 {
         let mut n = self.t5_next.min(self.alnk_next).min(self.tick_next).min(self.spi2_next).min(self.adc_next).min(self.spi1_irq_at);
-        n = n.min(self.uart.next).min(self.uart.ot_next).min(self.usb_next).min(self.wdt_at);
+        n = n.min(self.uart.next).min(self.uart.ot_next).min(self.usb_next).min(self.usb_packet_next).min(self.wdt_at);
         for t in &self.tmr {
             n = n.min(t.next);
         }
@@ -582,6 +585,10 @@ impl Periph {
             if self.usb_next <= self.cycles {
                 self.usb_next = self.cycles + self.usb_period;
             }
+        }
+        if self.cycles >= self.usb_packet_next {
+            due.usb_packet = true;
+            self.usb_packet_next = u64::MAX;
         }
         if self.cycles >= self.wdt_at {
             self.wdt_at = u64::MAX;
