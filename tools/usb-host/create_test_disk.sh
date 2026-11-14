@@ -8,6 +8,19 @@
 # Tests can assert on known filenames, sizes, and byte content.
 set -eu
 
+missing=
+for cmd in mkfs.fat mcopy python3; do
+    command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+done
+if [ -n "$missing" ]; then
+    echo "missing:$missing" >&2
+    echo "install with one of:" >&2
+    echo "  nix:  nix profile install nixpkgs#dosfstools nixpkgs#mtools nixpkgs#python3" >&2
+    echo "  apt:  sudo apt install dosfstools mtools python3" >&2
+    echo "  brew: brew install dosfstools mtools python3" >&2
+    exit 1
+fi
+
 IMG=${1:?usage: create_test_disk.sh OUTPUT [16|32]}
 FAT=${2:-16}
 case "$FAT" in

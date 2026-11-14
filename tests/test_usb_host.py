@@ -51,7 +51,7 @@ def run_guest(contract, directory, image, mode, interpreter):
     if interpreter:
         env["FM1_NO_JIT"] = "1"
     result = subprocess.run([str(live), "--fwsc", str(parent / guest["file"]),
-                             "--usb", "disk", "--disk-image", str(image),
+                             "--usb-mode", "host", "--disk", str(image),
                              "--bench", str(manifest["duration_ms"])],
                             env=env, capture_output=True, timeout=240)
     (directory / "stdout.log").write_bytes(result.stdout)

@@ -141,6 +141,7 @@ pub trait SectorStorage: Send {
     fn sectors(&self) -> u32;
     fn read_sector(&mut self, lba: u32, data: &mut [u8; 512]) -> std::io::Result<()>;
     fn write_sector(&mut self, lba: u32, data: &[u8; 512]) -> std::io::Result<()>;
+    fn as_bytes(&self) -> Option<&[u8]> { None }
 }
 
 /// One queued token. INDEX, target and DMA descriptors cannot be retargeted
@@ -461,6 +462,17 @@ impl Usb {
     /// Is a peer on the host port, and is it configured with its link or medium ready?
     pub fn peer_up(&self) -> Option<bool> {
         self.peer.as_ref().map(Peer::up)
+    }
+
+    pub fn disk_bytes(&self) -> Option<&[u8]> {
+        fn find(p: &Peer) -> Option<&[u8]> {
+            match p {
+                Peer::Disk(d) => d.storage.as_bytes(),
+                Peer::Hub(h) => h.children.iter().find_map(find),
+                Peer::Ethernet(_) => None,
+            }
+        }
+        self.peer.as_ref().and_then(find)
     }
 
     fn host_session(&self) -> bool {
