@@ -20,6 +20,43 @@ use std::time::SystemTime;
 
 use crate::nat::HostAddr;
 
+/// The virtual access point both WiFi flavours offer (--wifi-ssid, --wifi-password): WPA2,
+/// the SSID at most 32 bytes, the passphrase at most 63. (WPA2 wants 8 at least; the default
+/// "fm1pass" predates the check and the emulated AP takes a short one, so the floor is 1.)
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ap {
+    pub ssid: String,
+    pub password: String,
+}
+
+impl Default for Ap {
+    fn default() -> Self {
+        Self { ssid: "Home".into(), password: "fm1pass".into() }
+    }
+}
+
+impl Ap {
+    /// Why `ssid` and `password` would not do for a WPA2 network, if they would not.
+    pub fn check(ssid: &str, password: &str) -> Result<(), String> {
+        if ssid.is_empty() || ssid.len() > 32 {
+            return Err("the SSID is 1 to 32 bytes".into());
+        }
+        if !(1..=63).contains(&password.len()) || !password.is_ascii() {
+            return Err("a WPA2 passphrase is 1 to 63 ASCII characters (8 or more on a real network)".into());
+        }
+        Ok(())
+    }
+}
+
+/// A link the station reaches the subnet over (the WiFi chip, a USB network adapter). The
+/// SoC pumps Ethernet frames between every link and the `VirtualNet` (`Soc::net_pump`).
+pub trait Link {
+    /// The Ethernet frames the station sent since the last call.
+    fn drain_tx(&mut self) -> Vec<Vec<u8>>;
+    /// An Ethernet frame for the station.
+    fn push_rx(&mut self, eth: Vec<u8>);
+}
+
 /// The first and last host octets the DNS hands out for names (10.0.2.100 .. 10.0.2.254).
 const DNS_POOL: (u8, u8) = (100, 254);
 
@@ -78,12 +115,12 @@ fn dns_question_name(data: &[u8]) -> Option<String> {
     (!labels.is_empty()).then(|| labels.join("."))
 }
 
-const GW_MAC: [u8; 6] = [0x02, 0x53, 0x49, 0x4d, 0x00, 0x02];
-const STA_MAC: [u8; 6] = [0x02, 0x53, 0x49, 0x4d, 0x00, 0x15];
+pub const GW_MAC: [u8; 6] = [0x02, 0x53, 0x49, 0x4d, 0x00, 0x02];
+pub const STA_MAC: [u8; 6] = [0x02, 0x53, 0x49, 0x4d, 0x00, 0x15];
 
 const GW_IP: [u8; 4] = [10, 0, 2, 2];
 const DNS_IP: [u8; 4] = [10, 0, 2, 3];
-const STA_IP: [u8; 4] = [10, 0, 2, 15];
+pub const STA_IP: [u8; 4] = [10, 0, 2, 15];
 const MASK: [u8; 4] = [255, 255, 255, 0];
 
 const DHCP_LEASE: u32 = 86400;

@@ -43,7 +43,11 @@ use panel::{Ctl, ENCS, H, W};
 #[path = "../../fm1-emu/src/buildinfo.rs"]
 mod buildinfo;
 mod cdp;
+mod fit;
+#[cfg(windows)]
+mod exclusive;
 mod panel;
+mod wav;
 mod panel_smk;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -71,9 +75,58 @@ const RAM_BASE: u32 = 0x01c0_0000;
 const RAM_SIZE: usize = 1 << 20;
 /// How far emulated time runs ahead of the wall clock before audio starts.
 const LEAD_MS: f64 = 60.0;
-/// Once the firmware streams audio, the emulator runs whenever less than
-/// this much sound is queued: the audio device sets the pace.
-const AUDIO_TARGET_MS: f64 = 50.0;
+/// Once the firmware streams audio, the emulator runs whenever less than the target of sound
+/// is queued: the audio device sets the pace. The target starts at --latency and grows by this
+/// much at each underrun, up to AUDIO_TARGET_MAX_MS: a played note waits about that long.
+const AUDIO_TARGET_STEP_MS: f64 = 4.0;
+const AUDIO_TARGET_MAX_MS: f64 = 80.0;
+/// --latency's default: low on Windows, where it was measured; elsewhere the earlier 50 ms
+/// (the JIT's warm-up can underrun at the start there).
+const AUDIO_TARGET_DEFAULT_MS: f64 = if cfg!(windows) { 12.0 } else { 50.0 };
+/// After this long without an underrun the target comes back down (see [`AudioTarget`]).
+const AUDIO_TARGET_CALM: Duration = Duration::from_secs(10);
+
+/// How much audio the emulator keeps queued ahead of the device. An underrun raises it by a
+/// step. After a calm while it comes back down by a quarter of the way to the lowest it may
+/// go (at least half a step), so a burst of underruns (the start, while the JIT compiles the
+/// firmware's code, or another program busy for a moment) does not leave the latency high:
+/// from 80 ms to 12 in about two minutes. A step down that underruns within the calm while
+/// shows the device needs the level before it, which then becomes the lowest it goes for the
+/// rest of the run: no probing down and clicking again every minute.
+struct AudioTarget {
+    ms: f64,
+    /// --latency: the lowest asked for
+    floor: f64,
+    /// the lowest it goes now: --latency, or a level a step down from which underran
+    low: f64,
+    calm_since: Instant,
+    /// the last step down: the level before it, and when
+    probe: Option<(f64, Instant)>,
+}
+
+impl AudioTarget {
+    fn new(floor: f64, now: Instant) -> AudioTarget {
+        AudioTarget { ms: floor, floor, low: floor, calm_since: now, probe: None }
+    }
+
+    /// One look at the device: `underran` since the last.
+    fn update(&mut self, underran: bool, now: Instant) {
+        if underran {
+            if let Some((before, at)) = self.probe.take() {
+                if now.duration_since(at) < AUDIO_TARGET_CALM {
+                    self.low = self.low.max(before);
+                }
+            }
+            self.calm_since = now;
+            self.ms = (self.ms + AUDIO_TARGET_STEP_MS).min(AUDIO_TARGET_MAX_MS.max(self.floor)).max(self.low);
+        } else if self.ms > self.low && now.duration_since(self.calm_since) >= AUDIO_TARGET_CALM {
+            let down = ((self.ms - self.low) / 4.0).max(AUDIO_TARGET_STEP_MS / 2.0);
+            self.probe = Some((self.ms, now));
+            self.calm_since = now;
+            self.ms = (self.ms - down).max(self.low);
+        }
+    }
+}
 
 struct Opts {
     bin: String,
@@ -117,8 +170,25 @@ struct Opts {
     theme: String,
     /// --cdp PORT: serve a thin HTML page + WebSocket for remote LCD + control
     cdp: Option<u16>,
-    usb_host: bool,
+    /// --flash-chip NAME: which part the FM-1's flash is (the stock Puya, or the newer units' UC25HQ80)
+    flash_part: fm1_soc::FlashPart,
+    /// --latency MS: the audio queued ahead of the device to start with (it grows on underruns)
+    latency_ms: f64,
+    /// --buffer FRAMES: ask the audio device for this buffer size
+    buffer: Option<u32>,
+    /// --exclusive (Windows): the output in WASAPI exclusive mode
+    exclusive: bool,
+    /// --usb disk: a flash drive on the host port (`disk`: its image, --disk-image FILE)
+    usb_disk: bool,
     disk: Option<String>,
+    /// --usb ethernet: a USB network adapter on the host port (the virtual subnet behind it)
+    usb_ethernet: bool,
+    /// --wifi jieli (or --wifi alone): the vendor WiFi stack's view, fm1-base's plat_wifi_* mailbox
+    /// (firmware built with wifi_stack = "emu")
+    wifi_jieli: bool,
+    /// --wifi-ssid NAME, --wifi-password PASS: the virtual access point either flavour offers
+    wifi_ssid: String,
+    wifi_password: String,
 }
 
 /// Unbuffered sector I/O: a completed write is already in the backing file.
@@ -196,11 +266,23 @@ fn parse() -> Option<Opts> {
 
 /// The options that only do something together: refused rather than ignored.
 fn check_opts(o: &Opts) -> Result<(), String> {
-    if o.usb && o.usb_host {
-        return Err("--usb / --usb-mode device conflicts with --usb-mode host".into());
+    if o.usb && (o.usb_disk || o.usb_ethernet) {
+        return Err("--usb device (a cable to this computer: the FM-1 is the device) excludes --usb disk / ethernet (the FM-1 is the host): one role per run".into());
     }
-    if o.usb_host != o.disk.is_some() {
-        return Err("--usb-mode host requires --disk FILE; --disk requires host mode".into());
+    if o.usb_disk != o.disk.is_some() {
+        return Err("--usb disk needs --disk-image FILE, and --disk-image needs --usb disk".into());
+    }
+    if o.wifi_jieli && o.oss_wifi {
+        return Err("--wifi jieli and --wifi oss are two chips: one at a time".into());
+    }
+    if let Err(e) = fm1_soc::net::Ap::check(&o.wifi_ssid, &o.wifi_password) {
+        return Err(format!("--wifi-ssid / --wifi-password: {e}"));
+    }
+    if (o.wifi_ssid != "Home" || o.wifi_password != "fm1pass") && !(o.oss_wifi || o.wifi_jieli) {
+        return Err("--wifi-ssid / --wifi-password need a WiFi chip: --wifi oss or --wifi jieli".into());
+    }
+    if o.internet && !(o.oss_wifi || o.wifi_jieli || o.usb_ethernet) {
+        return Err("--net internet needs a link to reach it through: --wifi oss, --wifi jieli or --usb ethernet".into());
     }
     if o.seed.is_some() && o.flaky_core1.is_none() {
         return Err("--seed needs --flaky-core1 (it seeds its misreads)".into());
@@ -214,18 +296,65 @@ fn check_opts(o: &Opts) -> Result<(), String> {
 fn parse_args(a: Vec<String>) -> Option<Opts> {
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        record: None, lcd_only: false, name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
-                       flaky_core1: None, cpu1_survives: false, seed: None, flash: None, usb: false, oss_wifi: false,
-                       internet: false, allow_lan: false, theme: "default".into(), cdp: None,
-                       usb_host: false, disk: None };
+                       flaky_core1: None, cpu1_survives: false, seed: None, flash: None, usb: false, flash_part: fm1_soc::FlashPart::P25q80,
+                       latency_ms: AUDIO_TARGET_DEFAULT_MS, buffer: None, exclusive: false,
+                       oss_wifi: false, internet: false, allow_lan: false, theme: "default".into(), cdp: None,
+                       usb_disk: false, disk: None, usb_ethernet: false, wifi_jieli: false,
+                       wifi_ssid: "Home".into(), wifi_password: "fm1pass".into() };
     let mut i = 1;
     while i < a.len() {
-        if a[i] == "--usb" {
-            o.usb = true;
+        if a[i] == "--usb" || a[i].starts_with("--usb=") {
+            // --usb WHAT: the port's role and what is there. "device" (plain --usb; "computer" too):
+            // a cable to this computer, the FM-1 the device. Else the FM-1 is the host, with one or
+            // more of "ethernet" and "disk" on the port, comma-separated (two or more sit behind a
+            // hub, as on the dock).
+            let value = match a[i].strip_prefix("--usb=") {
+                Some(v) => v.to_string(),
+                None => match a.get(i + 1).filter(|v| !v.starts_with("--")) {
+                    Some(v) => { i += 1; v.clone() }
+                    None => "device".into(),
+                },
+            };
+            for what in value.split(',') {
+                match what {
+                    "device" | "computer" => o.usb = true,
+                    "ethernet" => o.usb_ethernet = true,
+                    "disk" => o.usb_disk = true,
+                    _ => return None,
+                }
+            }
             i += 1;
             continue;
         }
-        if a[i] == "--lcd-only" {
-            o.lcd_only = true;
+        if a[i] == "--net" || a[i].starts_with("--net=") {
+            // --net internet|lan: how far the subnet reaches (absent: offline)
+            let value = match a[i].strip_prefix("--net=") {
+                Some(v) => v.to_string(),
+                None => { i += 1; a.get(i)?.clone() }
+            };
+            match value.as_str() {
+                "offline" => (o.internet, o.allow_lan) = (false, false),
+                "internet" => o.internet = true,
+                "lan" => (o.internet, o.allow_lan) = (true, true),
+                _ => return None,
+            }
+            i += 1;
+            continue;
+        }
+        if a[i] == "--wifi" || a[i].starts_with("--wifi=") {
+            // --wifi jieli (the vendor stack's view, also plain --wifi), --wifi oss (the clean-room driver's chip)
+            let value = match a[i].strip_prefix("--wifi=") {
+                Some(v) => v.to_string(),
+                None => match a.get(i + 1).filter(|v| !v.starts_with("--")) {
+                    Some(v) => { i += 1; v.clone() }
+                    None => "jieli".into(),
+                },
+            };
+            match value.as_str() {
+                "oss" => o.oss_wifi = true,
+                "jieli" => o.wifi_jieli = true,
+                _ => return None,
+            }
             i += 1;
             continue;
         }
@@ -244,13 +373,27 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
             i += 1;
             continue;
         }
+        if a[i] == "--exclusive" {
+            o.exclusive = true;
+            i += 1;
+            continue;
+        }
+        if a[i] == "--lcd-only" {
+            o.lcd_only = true;
+            i += 1;
+            continue;
+        }
         match a[i].as_str() {
+            // (the older spellings: --usb-mode device|host|ethernet, --disk FILE)
             "--usb-mode" => match a.get(i + 1)?.as_str() {
                 "device" => o.usb = true,
-                "host" => o.usb_host = true,
+                "host" => o.usb_disk = true,
+                "ethernet" => o.usb_ethernet = true,
                 _ => return None,
             },
-            "--disk" => o.disk = Some(a.get(i + 1)?.clone()),
+            "--disk" | "--disk-image" => o.disk = Some(a.get(i + 1)?.clone()),
+            "--wifi-ssid" => o.wifi_ssid = a.get(i + 1)?.clone(),
+            "--wifi-password" => o.wifi_password = a.get(i + 1)?.clone(),
             "--bin" => {
                 o.bin = a.get(i + 1)?.clone();
                 o.name = o.bin.rsplit('/').next().unwrap_or("").trim_end_matches(".bin").trim_end_matches(".xip").to_string();
@@ -287,9 +430,12 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
             "--seed" => o.seed = Some(a.get(i + 1)?.parse().ok()?),
             "--cpu1-survives" => { o.cpu1_survives = true; i -= 1; }
             "--flash" => o.flash = Some(a.get(i + 1)?.clone()),
+            "--flash-chip" => o.flash_part = fm1_soc::FlashPart::parse(a.get(i + 1)?)?,
             "--record" => o.record = Some(a.get(i + 1)?.clone()),
             "--theme" => o.theme = a.get(i + 1)?.clone(),
             "--cdp" => o.cdp = Some(a.get(i + 1)?.parse().ok()?),
+            "--latency" => o.latency_ms = a.get(i + 1)?.parse::<f64>().ok().filter(|v| (1.0..=500.0).contains(v))?,
+            "--buffer" => o.buffer = Some(a.get(i + 1)?.parse().ok().filter(|v| (16..=8192).contains(v))?),
             _ => return None,
         }
         i += 2;
@@ -333,6 +479,8 @@ impl Machine {
             None => std::fs::read(&o.bin)?,
         };
         let mut soc = Soc::new(RAM_SIZE, image);
+        // (before the boot: the board sets the flash chip's id from it)
+        soc.set_flash_part(o.flash_part);
         let strict = std::env::var_os("FM1_STRICT").is_some();
         // FM1_STRICT: as an FM-1 is (misaligned RAM accesses fault, the LCD's transfers take their
         // time) and as it is timed: each instruction its measured cost (fm1_core's op_cost8) on a
@@ -377,16 +525,26 @@ impl Machine {
         if o.usb {
             soc.usb_plug();
         }
+        soc.set_wifi_ap(fm1_soc::net::Ap { ssid: o.wifi_ssid.clone(), password: o.wifi_password.clone() });
         if o.oss_wifi {
             soc.enable_oss_wifi();
-            if o.internet {
-                soc.enable_internet(o.allow_lan);
-            }
-        } else if o.internet {
-            eprintln!("--internet: nothing to reach it through without --oss-wifi");
         }
+        if o.wifi_jieli {
+            soc.enable_vendor_wifi();
+        }
+        // what hangs off the host port: one device on the cable, two behind a hub as on the dock
+        let mut devices: Vec<fm1_soc::usb::Attachment> = Vec::new();
         if let Some(disk) = disk {
-            soc.usb_disk(Box::new(disk));
+            devices.push(fm1_soc::usb::Attachment::Disk(Box::new(disk)));
+        }
+        if o.usb_ethernet {
+            devices.push(fm1_soc::usb::Attachment::Ethernet);
+        }
+        if !devices.is_empty() {
+            soc.usb_attach(devices);
+        }
+        if o.internet {
+            soc.enable_internet(o.allow_lan);
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -437,7 +595,44 @@ impl Machine {
 
 /// Ask for a performance core: macOS runs default-QoS background threads on
 /// the efficiency cores, which made the emulator ~40% slower than on main.
-fn high_priority() {
+/// While it lives (Windows): the 1 ms timer period [`high_priority`] asked for.
+#[must_use]
+struct Priority;
+
+#[cfg(windows)]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(ms: u32) -> u32;
+    fn timeEndPeriod(ms: u32) -> u32;
+}
+
+impl Drop for Priority {
+    fn drop(&mut self) {
+        // SAFETY: pairs the timeBeginPeriod(1) in high_priority
+        #[cfg(windows)]
+        unsafe {
+            timeEndPeriod(1);
+        }
+    }
+}
+
+/// The calling thread above normal (the emulation, a benchmark); on Windows also 1 ms timer
+/// ticks for its short sleeps, until the [`Priority`] returned is dropped.
+fn high_priority() -> Priority {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        const THREAD_PRIORITY_HIGHEST: i32 = 2;
+        // SAFETY: plain calls on the current thread
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            timeBeginPeriod(1);
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         extern "C" {
@@ -448,6 +643,7 @@ fn high_priority() {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         }
     }
+    Priority
 }
 
 fn bench(o: &Opts, ms: u64, theme: &'static panel::Theme) {
@@ -635,54 +831,81 @@ struct AudioRing {
     /// Set once the firmware has produced sound (silence before that is boot).
     started: AtomicBool,
     underruns: AtomicU64,
+    /// The stream died after it had started (the exclusive one: the device unplugged or no
+    /// longer answering): the emulation goes by the clock instead.
+    dead: AtomicBool,
 }
 
-fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
+fn start_audio(ring: Arc<AudioRing>, buffer: Option<u32>) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let dev = host.default_output_device().ok_or("no audio output device")?;
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
     if cfg.sample_format() != cpal::SampleFormat::F32 {
         return Err(format!("output format {:?} not handled (f32 only)", cfg.sample_format()));
     }
-    let channels = cfg.channels() as usize;
-    let rate = cfg.sample_rate().0 as f64;
-    let step = 44_100.0 / rate; // source frames per output frame
-    let (mut pos, mut cur, mut next) = (0.0f64, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
-    let stream = dev
-        .build_output_stream(
-            &cfg.config(),
-            move |out: &mut [f32], _| {
-                let mut q = ring.q.lock().unwrap();
-                let mut starved = false;
-                for frame in out.chunks_mut(channels) {
-                    pos += step;
-                    while pos >= 1.0 {
-                        pos -= 1.0;
-                        cur = next;
-                        next = match (q.pop_front(), q.pop_front()) {
-                            (Some(l), Some(r)) => (l as f32 / 32768.0, r as f32 / 32768.0),
-                            _ => {
-                                starved = true;
-                                (0.0, 0.0)
-                            }
-                        };
-                    }
-                    let f = pos as f32;
-                    let (l, r) = (cur.0 + (next.0 - cur.0) * f, cur.1 + (next.1 - cur.1) * f);
-                    for (c, s) in frame.iter_mut().enumerate() {
-                        *s = if c % 2 == 0 { l } else { r };
-                    }
-                }
-                if starved && ring.started.load(Ordering::Relaxed) {
-                    ring.underruns.fetch_add(1, Ordering::Relaxed);
-                }
-            },
-            |e| eprintln!("audio: {e}"),
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+    let mut config = cfg.config();
+    if let Some(n) = buffer {
+        let ok = match cfg.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => (*min..=*max).contains(&n),
+            cpal::SupportedBufferSize::Unknown => true,
+        };
+        if ok {
+            config.buffer_size = cpal::BufferSize::Fixed(n);
+        } else {
+            eprintln!("audio: the device does not take a {n}-frame buffer ({:?}); its own it is", cfg.buffer_size());
+        }
+    }
+    let stream = match output_stream(&dev, &config, ring.clone()) {
+        Ok(s) => s,
+        Err(e) if config.buffer_size != cpal::BufferSize::Default => {
+            eprintln!("audio: a {:?} buffer: {e}; the device's own it is", config.buffer_size);
+            config.buffer_size = cpal::BufferSize::Default;
+            output_stream(&dev, &config, ring)?
+        }
+        Err(e) => return Err(e),
+    };
+    eprintln!("audio: {} at {} Hz, {} channels, buffer {:?}", dev.name().unwrap_or_default(), config.sample_rate.0, config.channels, config.buffer_size);
     stream.play().map_err(|e| e.to_string())?;
     Ok(stream)
+}
+
+/// The output stream: the ring's 44.1 kHz frames, resampled to the device's rate.
+fn output_stream(dev: &cpal::Device, config: &cpal::StreamConfig, ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
+    let channels = config.channels as usize;
+    let step = 44_100.0 / config.sample_rate.0 as f64; // source frames per output frame
+    let (mut pos, mut cur, mut next) = (0.0f64, (0.0f32, 0.0f32), (0.0f32, 0.0f32));
+    dev.build_output_stream(
+        config,
+        move |out: &mut [f32], _| {
+            let mut q = ring.q.lock().unwrap();
+            let mut starved = false;
+            for frame in out.chunks_mut(channels) {
+                pos += step;
+                while pos >= 1.0 {
+                    pos -= 1.0;
+                    cur = next;
+                    next = match (q.pop_front(), q.pop_front()) {
+                        (Some(l), Some(r)) => (l as f32 / 32768.0, r as f32 / 32768.0),
+                        _ => {
+                            starved = true;
+                            (0.0, 0.0)
+                        }
+                    };
+                }
+                let f = pos as f32;
+                let (l, r) = (cur.0 + (next.0 - cur.0) * f, cur.1 + (next.1 - cur.1) * f);
+                for (c, s) in frame.iter_mut().enumerate() {
+                    *s = if c % 2 == 0 { l } else { r };
+                }
+            }
+            if starved && ring.started.load(Ordering::Relaxed) {
+                ring.underruns.fetch_add(1, Ordering::Relaxed);
+            }
+        },
+        |e| eprintln!("audio: {e}"),
+        None,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Headless panel picture: C4-E4-G4 held from 0.8 s, PLAY pressed at 1.2 s,
@@ -1307,12 +1530,36 @@ const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package:
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
 options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE]
-         [--usb | --usb-mode device | --usb-mode host --disk FILE]
-         Disk images are opened writable without creation or truncation and exclusively locked.
-         Other tools must honor the advisory lock; do not mount or edit an image during a run.
-         [--theme NAME] [--flaky-core1 RATE [--seed N]] [--cpu1-survives] [--version] [--help]
-         [--oss-wifi [--internet [--allow-lan]]]  the WiFi chip for a clean-room driver; the real
-                      network behind its virtual AP (off by default); this computer and its LAN too
+         [--usb device | --usb ethernet | --usb disk --disk-image FILE]   the USB port's role and what is there
+                      device (plain --usb): a cable to this computer, the FM-1 the device (USB-MIDI, USB audio,
+                      whatever the firmware offers); else the FM-1 is the host: a CDC-ECM Ethernet adapter, or a
+                      flash drive (its image opened writable, never created or truncated, exclusively locked:
+                      do not mount or edit it during a run). disk,ethernet together: both behind a hub, as on
+                      the dock. One role per run
+         [--net internet | --net lan]   how far the network behind --wifi / --usb ethernet reaches: the real
+                      network through a NAT over this computer's sockets (off by default: a firmware reaches
+                      nothing outside the emulator); lan adds this computer's own addresses and its LAN
+         [--theme NAME] the panel color theme (default, cool-gray, black, orange, black-green, purple, white-blue)
+         [--latency MS] (12 on Windows, else 50)
+                                 audio queued ahead of the device to start with; it grows by itself
+                                 on underruns and back down after 10 s without one, no lower
+                                 than a level that underran
+         [--buffer FRAMES]       the audio device's buffer, if it takes one
+         [--exclusive]           Windows: the output in WASAPI exclusive mode, the device's shortest
+                                 period (lowest latency; other programs can't play on it meanwhile)
+         [--flash-chip p25q80|uc25hq80]
+                                 the FM-1's flash part: the stock Puya P25Q80 (85 60 14), or the
+                                 UC25HQ80 (B3 60 14) of units sold since autumn 2026
+         [--flaky-core1 RATE [--seed N]] [--cpu1-survives] [--version] [--help]
+         [--wifi oss]  the WiFi chip for a clean-room driver (modd's): a virtual AP \"Home\" and the subnet
+                      behind it (DHCP, DNS, SNTP), an open \"Cafe\" beside it
+         [--wifi jieli]  the vendor stack's view instead (plain --wifi is this): the plat_wifi_* mailbox an
+                      fm1-base firmware built with wifi_stack = \"emu\" talks to (JieLi's binary driver itself
+                      is not emulated: a firmware linking it finds no chip), the same APs and subnet
+         [--wifi-ssid NAME] [--wifi-password PASS]  the WPA2 access point either flavour offers (Home / fm1pass):
+                      a driver joins with these or not at all; an open \"Cafe\" is around too
+         (--oss-wifi, --internet, --allow-lan, --usb-mode device|host|ethernet, --disk FILE: the older
+                      spellings of --wifi oss, --net internet, --net lan, --usb ..., --disk-image; still taken)
 remote:   --cdp PORT   serve a thin HTML page + WebSocket on PORT for remote LCD + control (JSON-RPC)
 headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
           --shot MS    run MS ms, then write the panel to work/panel.ppm
@@ -1351,7 +1598,130 @@ env: FM1_BENCH_KEYS='T:PLAY,T:PLAY^,T:C4@100,T:e0:+3,T:pot:512,T:mHEX'  scripted
      FM1_TPROF=PATH,FROM,TO  --shot: both cores' time-weighted PCs and the flash cache's misses by line from
                            FROM to TO ms, into PATH (with FM1_STRICT: where the cycles go)";
 
+/// A firmware package from a file dialog (Windows, macOS).
+#[cfg(any(windows, target_os = "macos"))]
+fn pick_firmware() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new().add_filter("FM-1 firmware", &["fwsc"]).set_title("Open an FM-1 firmware").pick_file()
+}
+
+/// F4: pick another firmware package; the arguments to start again on it. The run then ends as
+/// on Esc (the emulation stopped, a WAV being recorded finished, MIDI and audio let go of) and
+/// [`restart`] starts the new one.
+fn open_another() -> Option<Vec<String>> {
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(path) = pick_firmware() {
+        let now: Vec<String> = std::env::args().skip(1).collect();
+        let mut args = carried_over(&now);
+        args.push("--fwsc".into());
+        args.push(path.to_string_lossy().into_owned());
+        return Some(args);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    eprintln!("F4: give the firmware on the command line here (--fwsc FILE)");
+    None
+}
+
+/// The options that carry over to another firmware: how it runs, not what it is. A firmware's
+/// own (`--flash`, its saves; `--syx`, its sounds; `--entry` and the rest) stay behind, so the
+/// new one never loads or overwrites the old one's flash.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn carried_over(args: &[String]) -> Vec<String> {
+    const WITH_VALUE: [&str; 11] = ["--mhz", "--midi", "--midi-ch", "--latency", "--buffer", "--map", "--flash-chip", "--wifi",
+                                    "--wifi-ssid", "--wifi-password", "--net"];
+    const FLAGS: [&str; 6] = ["--usb", "--exclusive", "--midi-log", "--oss-wifi", "--internet", "--allow-lan"];
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        // (a disk's image is this run's: --usb disk is not carried, --usb ethernet / computer are)
+        let next_is_value = i + 1 < args.len() && !args[i + 1].starts_with("--");
+        if a == "--usb" && next_is_value {
+            let kept: Vec<&str> = args[i + 1].split(',').filter(|w| *w != "disk").collect();
+            if !kept.is_empty() {
+                out.push(args[i].clone());
+                out.push(kept.join(","));
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--usb=") {
+            let kept: Vec<&str> = v.split(',').filter(|w| *w != "disk").collect();
+            if !kept.is_empty() {
+                out.push(format!("--usb={}", kept.join(",")));
+            }
+            i += 1;
+            continue;
+        }
+        let usb_with_value = false;
+        let bare_wifi = a == "--wifi" && !next_is_value;
+        if bare_wifi {
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        if (WITH_VALUE.contains(&a) || usb_with_value) && i + 1 < args.len() {
+            out.extend_from_slice(&args[i..i + 2]);
+            i += 2;
+            continue;
+        }
+        if FLAGS.contains(&a) || a.starts_with("--wifi=") || a.starts_with("--net=") {
+            out.push(args[i].clone());
+        }
+        i += 1;
+    }
+    out
+}
+
+/// F4's new run, once this one has stopped. On Unix it takes this process's place (the same
+/// terminal, Ctrl-C reaches it); on Windows this process waits for it and exits as it does.
+fn restart(args: &[String]) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return eprintln!("F4: cannot start again: {e}"),
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = cmd.exec();
+        eprintln!("F4: cannot start again: {e}");
+    }
+    #[cfg(not(unix))]
+    match cmd.status() {
+        Ok(st) => std::process::exit(st.code().unwrap_or(1)),
+        Err(e) => eprintln!("F4: cannot start again: {e}"),
+    }
+}
+
+/// Started with a double-click, not from a terminal or a script: on Windows the program has a
+/// console of its own (no other process on it); on macOS launchd started it (Finder) and its
+/// input is no terminal.
+#[cfg(any(windows, target_os = "macos"))]
+fn double_clicked() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+        }
+        let mut ids = [0u32; 4];
+        // SAFETY: the buffer holds the count given
+        unsafe { GetConsoleProcessList(ids.as_mut_ptr(), ids.len() as u32) == 1 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::IsTerminal;
+        extern "C" {
+            fn getppid() -> i32;
+        }
+        // SAFETY: getppid takes nothing and cannot fail
+        !std::io::stdin().is_terminal() && unsafe { getppid() } == 1
+    }
+}
+
 fn main() {
+    fit::dpi_aware();
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("{}", buildinfo::version("fm1-live"));
         if let Some(w) = buildinfo::stale() {
@@ -1361,6 +1731,26 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!("{USAGE}");
+        return;
+    }
+    // started with nothing by a double-click: ask for a firmware package (from a terminal or a
+    // script: the usage, as before)
+    #[cfg(any(windows, target_os = "macos"))]
+    if std::env::args().len() == 1 && double_clicked() {
+        if let Some(path) = pick_firmware() {
+            let run = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--fwsc").arg(&path).status());
+            // a firmware that would not load: its error stays readable, not gone with the console
+            let failed = match run {
+                Ok(st) if st.success() => None,
+                Ok(st) => Some(format!("fm1-live stopped ({st})")),
+                Err(e) => Some(format!("cannot start fm1-live: {e}")),
+            };
+            if let Some(why) = failed {
+                eprintln!("\n{why}. Press Enter to close.");
+                let _ = std::io::stdin().read_line(&mut String::new());
+                std::process::exit(1);
+            }
+        }
         return;
     }
     let Some(o) = parse() else {
@@ -1378,7 +1768,7 @@ fn main() {
     if let Some(ms) = o.bench {
         if std::env::var("FM1_BENCH_THREAD").is_ok() {
             let o2 = Opts { bin: o.bin.clone(), ..o };
-            return std::thread::spawn(move || { high_priority(); bench(&o2, ms, theme) }).join().unwrap();
+            return std::thread::spawn(move || { let _p = high_priority(); bench(&o2, ms, theme) }).join().unwrap();
         }
         return bench(&o, ms, theme);
     }
@@ -1397,12 +1787,35 @@ fn main() {
     }
     let mut pot = m.soc.periph.adc_value[4];
 
-    let ring = Arc::new(AudioRing { q: Mutex::new(VecDeque::new()), started: AtomicBool::new(false), underruns: AtomicU64::new(0) });
-    let _stream = match start_audio(ring.clone()) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            eprintln!("audio off: {e}");
-            None
+    let ring = Arc::new(AudioRing { q: Mutex::new(VecDeque::new()), started: AtomicBool::new(false), underruns: AtomicU64::new(0), dead: AtomicBool::new(false) });
+    #[cfg(windows)]
+    let exclusive_on = o.exclusive
+        && match exclusive::start(ring.clone()) {
+            Ok(msg) => {
+                eprintln!("{msg}");
+                true
+            }
+            Err(e) => {
+                eprintln!("--exclusive: {e}; the shared output it is");
+                false
+            }
+        };
+    #[cfg(not(windows))]
+    let exclusive_on = {
+        if o.exclusive {
+            eprintln!("--exclusive: Windows only; the default output it is");
+        }
+        false
+    };
+    let _stream = if exclusive_on {
+        None
+    } else {
+        match start_audio(ring.clone(), o.buffer) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("audio off: {e}");
+                None
+            }
         }
     };
     let lcd = Arc::new(Mutex::new(vec![0u16; 240 * 240]));
@@ -1415,19 +1828,26 @@ fn main() {
     let _midi = midi_inputs(&o, &tx);
     let (usb_tx, usb_rx) = mpsc::channel::<Vec<u8>>();
     let usb_on = o.usb;
+    // F3: a WAV of what the firmware plays, written as the emulation makes it
+    let recorder: Arc<Mutex<Option<wav::Wav>>> = Arc::new(Mutex::new(None));
 
-    let audio_ok = _stream.is_some();
+    let audio_ok = _stream.is_some() || exclusive_on;
     let emu = {
         let (ring, lcd, leds, pads, status, quit) = (ring.clone(), lcd.clone(), leds.clone(), pads.clone(), status.clone(), quit.clone());
         let flash = o.flash.clone();
+        let recorder = recorder.clone();
+        let floor_ms = o.latency_ms;
         std::thread::spawn(move || {
-            high_priority();
+            let _priority = high_priority();
             let start = Instant::now();
             let mut offset_ms = 0.0f64; // wall-clock time given up after falling behind
             let mut last_lcd = Instant::now();
             let mut last_stat = Instant::now();
             let (mut stat_emu, mut stat_wall) = (0u64, Instant::now());
             let mut usb_ports = UsbPorts::default();
+            let mut target = AudioTarget::new(floor_ms, Instant::now());
+            let mut underruns_seen = 0u64;
+            let mut audio_lost = false;
             while !quit.load(Ordering::Relaxed) {
                 while let Ok(a) = rx.try_recv() {
                     m.soc.periph.apply(&a);
@@ -1441,8 +1861,18 @@ fn main() {
                     offset_ms += real - emu_ms - LEAD_MS; // too far behind: resync, do not race
                 }
                 let buffered = ring.q.lock().unwrap().len() as f64 / 88.2;
-                let behind = if audio_ok && m.soc.periph.audio_halves > 0 {
-                    buffered < AUDIO_TARGET_MS
+                // an underrun: a little more queued from now on; a calm while: a little less
+                let u = ring.underruns.load(Ordering::Relaxed);
+                target.update(u > underruns_seen, Instant::now());
+                underruns_seen = u;
+                // the audio stream died (the exclusive one, a device unplugged): the clock paces
+                // the emulation from here, so it does not stop waiting for a device that is gone
+                if audio_ok && !audio_lost && ring.dead.load(Ordering::Relaxed) {
+                    audio_lost = true;
+                    offset_ms = start.elapsed().as_secs_f64() * 1000.0 - emu_ms;
+                }
+                let behind = if audio_ok && !audio_lost && m.soc.periph.audio_halves > 0 {
+                    buffered < target.ms
                 } else {
                     emu_ms < real + LEAD_MS
                 };
@@ -1456,6 +1886,19 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 if !m.soc.periph.audio.is_empty() {
+                    let stopped = {
+                        let mut r = recorder.lock().unwrap();
+                        if let Some(w) = r.as_mut() {
+                            w.write(&m.soc.periph.audio);
+                        }
+                        if r.as_ref().is_some_and(|w| w.error.is_some()) { r.take() } else { None }
+                    };
+                    // a failed write or the size limit: the take ends here, and says why
+                    if let Some(w) = stopped {
+                        if let Err(e) = w.finish() {
+                            eprintln!("recording: {e}");
+                        }
+                    }
                     let mut q = ring.q.lock().unwrap();
                     q.extend(m.soc.periph.audio.drain(..));
                     ring.started.store(true, Ordering::Relaxed);
@@ -1482,8 +1925,9 @@ fn main() {
                     let speed = (e - stat_emu) as f64 / stat_wall.elapsed().as_secs_f64() / 1000.0;
                     let buffered = ring.q.lock().unwrap().len() as f64 / 88.2;
                     *status.lock().unwrap() = format!(
-                        "{:.2}x real time | {} MHz | audio {:.0} ms buffered, {} underruns",
-                        speed, m.soc.periph.hz / 1_000_000, buffered, ring.underruns.load(Ordering::Relaxed)
+                        "{:.2}x real time | {} MHz | audio {:.0} ms queued (target {:.0}), {} underruns{}",
+                        speed, m.soc.periph.hz / 1_000_000, buffered, target.ms, ring.underruns.load(Ordering::Relaxed),
+                        if audio_lost { " | AUDIO STOPPED" } else { "" }
                     );
                     if e / 2000 != stat_emu / 2000 {
                         eprintln!("[{:5.1} s] {}", e as f64 / 1000.0, status.lock().unwrap());
@@ -1503,7 +1947,15 @@ fn main() {
         let _ = emu.join();
         return;
     }
-    let mut win = match Window::new(&format!("FM-1 · {} (emulated)", o.name), W, H, WindowOptions::default()) {
+    // as large as the display scaling asks, no larger than the screen; resizable (fit.rs)
+    let ((ww, wh), at) = fit::start(W, H, None);
+    // (elsewhere the window stays as it was: minifb scales it for the display itself)
+    let opts = if cfg!(windows) {
+        WindowOptions { resize: true, scale_mode: minifb::ScaleMode::UpperLeft, ..WindowOptions::default() }
+    } else {
+        WindowOptions::default()
+    };
+    let mut win = match Window::new(&format!("FM-1 · {} (emulated)", o.name), ww, wh, opts) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("window: {e}");
@@ -1513,6 +1965,10 @@ fn main() {
         }
     };
     win.set_target_fps(60);
+    if let Some((x, y)) = at {
+        win.set_position(x, y);
+    }
+    let mut fit = fit::Fit::new(W, H);
     let base = panel::base(theme);
     let mut buf = vec![0u32; W * H];
     let mut down = [false; 41];
@@ -1526,9 +1982,11 @@ fn main() {
     let (mut last_y, mut drag_acc) = (0f32, 0f32);
     let mut last_title = Instant::now();
     eprintln!("mouse: click/drag the keys (lower = harder; drag down on a held key = aftertouch), click buttons, drag or scroll the knobs (MASTER = volume)");
-    eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
+    eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; F3 records a WAV (to Music/fm1-emu); F4 another firmware; Esc quits");
 
-    while win.is_open() && !win.is_key_down(Key::Escape) {
+    // F4 picked another firmware: what to start once this run has ended
+    let mut next: Option<Vec<String>> = None;
+    while win.is_open() && !win.is_key_down(Key::Escape) && next.is_none() {
         let turn = |i: usize, clicks: i32, enc_clicks: &mut [i32; 7], turning: &mut [u32; 8]| {
             enc_clicks[i] += clicks;
             turning[i] = 10;
@@ -1536,7 +1994,7 @@ fn main() {
         };
 
         // ---- mouse
-        let pos = win.get_mouse_pos(MouseMode::Clamp);
+        let pos = mouse_pos(&win).map(|(x, y)| fit.to_panel(x, y));
         let pressed = win.get_mouse_down(MouseButton::Left);
         if let Some((mx, my)) = pos {
             if pressed && !was_pressed {
@@ -1641,8 +2099,12 @@ fn main() {
                 Key::Up => turn(1, 1, &mut enc_clicks, &mut turning),
                 Key::Comma => turn(2, -1, &mut enc_clicks, &mut turning),
                 Key::Period => turn(2, 1, &mut enc_clicks, &mut turning),
+                Key::F4 => next = open_another(),
                 _ => {}
             }
+        }
+        if win.is_key_pressed(Key::F3, KeyRepeat::No) {
+            toggle_record(&recorder, &o.name);
         }
         for t in turning.iter_mut() {
             *t = t.saturating_sub(1);
@@ -1656,11 +2118,18 @@ fn main() {
             }
         }
         {
-            let fb = lcd.lock().unwrap();
+            // the emulator thread waits on this lock to publish a frame: copy, then draw unlocked
+            let fb = lcd.lock().unwrap().clone();
             let st = panel::State { lcd: &fb, enc_clicks: &enc_clicks, pot, down: &down, leds: &shown_leds, turning: &turning };
             panel::draw(&mut buf, &base, &st, theme);
         }
-        if win.update_with_buffer(&buf, W, H).is_err() {
+        if let Some(w) = recorder.lock().unwrap().as_ref() {
+            let s = w.frames / 44_100;
+            panel::text(&mut buf, (W - 90) as f32, 12.0, &format!("REC {}:{:02}", s / 60, s % 60), 2, 0xff5050);
+        }
+        let (ww, wh) = if cfg!(windows) { win.get_size() } else { (W, H) };
+        let (frame, fw, fh) = fit.frame(&buf, ww, wh);
+        if win.update_with_buffer(frame, fw, fh).is_err() {
             break;
         }
         if last_title.elapsed() >= Duration::from_millis(500) {
@@ -1670,6 +2139,50 @@ fn main() {
     }
     quit.store(true, Ordering::Relaxed);
     let _ = emu.join();
+    // the window closed while recording: the file keeps what was played, with its length
+    let last = recorder.lock().unwrap().take();
+    if let Some(w) = last {
+        match w.finish() {
+            Ok(p) => eprintln!("recorded {}", p.display()),
+            Err(e) => eprintln!("recording: {e}"),
+        }
+    }
+    // F4: the new firmware, now that this one has stopped, with the window, the MIDI inputs
+    // (WinMM's are one program's at a time) and the audio device let go of first
+    if let Some(args) = next {
+        drop(win);
+        drop(_midi);
+        drop(_stream);
+        restart(&args);
+    }
+}
+
+/// F3: start a WAV of the output (in the Music folder's fm1-emu), or finish the one being written.
+/// (The file is finished or created outside the lock, which the emulation thread takes for every
+/// block: a slow disk must not hold up the audio.)
+fn toggle_record(rec: &Mutex<Option<wav::Wav>>, name: &str) {
+    let taken = rec.lock().unwrap().take();
+    match taken {
+        Some(w) => match w.finish() {
+            Ok(p) => eprintln!("recorded {}", p.display()),
+            Err(e) => eprintln!("recording: {e}"),
+        },
+        None => match wav::Wav::create(name) {
+            Ok(w) => {
+                eprintln!("recording to {} (F3 stops)", w.path.display());
+                *rec.lock().unwrap() = Some(w);
+            }
+            Err(e) => eprintln!("recording: {e}"),
+        },
+    }
+}
+
+/// The mouse in the window, clamped to it. Not minifb's MouseMode::Clamp: in 0.28 it panics on a
+/// window of no size (minimized: `width - 1` is negative, and f32::clamp asserts min <= max).
+fn mouse_pos(win: &Window) -> Option<(f32, f32)> {
+    let (w, h) = win.get_size();
+    let (w, h) = ((w as f32 - 1.0).max(0.0), (h as f32 - 1.0).max(0.0));
+    win.get_mouse_pos(MouseMode::Pass).map(|(x, y)| (x.clamp(0.0, w), y.clamp(0.0, h)))
 }
 
 /// The SMK-37's window: its panel (panel_smk.rs), the mouse on its keys (velocity: how far down
@@ -1708,7 +2221,7 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
     eprintln!("SMK-37: click the keys (lower = harder), pads, buttons; drag faders, wheels, knobs. A..' C4..F5, Z/X OCTAVE, Space SEQ PLAY, R SEQ REC, 1..8 pads, arrows K1/K2; Esc quits");
     while win.is_open() && !win.is_key_down(Key::Escape) {
         let pressed = win.get_mouse_down(MouseButton::Left);
-        if let Some((mx, my)) = win.get_mouse_pos(MouseMode::Clamp) {
+        if let Some((mx, my)) = mouse_pos(&win) {
             // (the window may be resized: back to panel coordinates)
             let (ww, wh) = win.get_size();
             let (mx, my) = (mx * w as f32 / ww.max(1) as f32, my * h as f32 / wh.max(1) as f32);
@@ -1811,7 +2324,7 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
             *t = t.saturating_sub(1);
         }
         {
-            let fb = lcd.lock().unwrap();
+            let fb = lcd.lock().unwrap().clone();
             let l = *leds.lock().unwrap();
             let pc = *pads.lock().unwrap();
             let st = panel_smk::State {
@@ -1840,6 +2353,67 @@ fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: 
 
 #[cfg(test)]
 mod tests {
+    use super::AudioTarget;
+    use std::time::{Duration, Instant};
+
+    /// The target over a run: `needs` ms keep the device fed; each look is a second apart.
+    fn run(t: &mut AudioTarget, t0: Instant, from_s: u64, to_s: u64, needs: f64) -> Vec<f64> {
+        let mut seen = Vec::new();
+        for s in from_s..to_s {
+            t.update(t.ms < needs, t0 + Duration::from_secs(s));
+            seen.push(t.ms);
+        }
+        seen
+    }
+
+    #[test]
+    fn the_target_settles_where_the_device_is_fed_and_stays() {
+        let t0 = Instant::now();
+        let mut t = AudioTarget::new(12.0, t0);
+        // a device that needs 20 ms (WASAPI shared: a 10 ms period and jitter)
+        let first = run(&mut t, t0, 0, 120, 20.0);
+        let settled = t.ms;
+        assert!(settled >= 20.0 && settled <= 24.0, "settled at {settled}: {first:?}");
+        // then an hour: no more underruns, no more probing below what it needs
+        let later = run(&mut t, t0, 120, 3720, 20.0);
+        assert!(later.iter().all(|&ms| ms >= 20.0), "went under 20: {:?}", later.iter().cloned().fold(f64::MAX, f64::min));
+        assert_eq!(later.last(), later.first(), "it still moves: {:?}", &later[..40]);
+    }
+
+    #[test]
+    fn a_burst_at_the_start_comes_back_down_in_minutes() {
+        let t0 = Instant::now();
+        let mut t = AudioTarget::new(12.0, t0);
+        // the JIT's warm-up: underruns all the way up to the cap
+        for s in 0..20 {
+            t.update(true, t0 + Duration::from_secs(s));
+        }
+        assert_eq!(t.ms, 80.0);
+        // then a device that is fine at 12 ms
+        let mut s = 20;
+        while t.ms > 12.0 {
+            s += 1;
+            t.update(false, t0 + Duration::from_secs(s));
+            assert!(s < 20 + 180, "still at {} ms after {} s", t.ms, s - 20);
+        }
+    }
+
+    #[test]
+    fn a_high_latency_stays_where_it_was_set() {
+        let t0 = Instant::now();
+        let mut t = AudioTarget::new(200.0, t0);
+        t.update(true, t0 + Duration::from_secs(1));
+        assert_eq!(t.ms, 200.0);
+    }
+
+    #[test]
+    fn f4_carries_over_how_it_runs_not_the_firmware() {
+        let a: Vec<String> = ["--fwsc", "a.fwsc", "--flash", "a.bin", "--mhz", "320", "--syx", "b.syx", "--usb",
+                              "--midi", "MPK", "--entry", "0x02000120", "--midi-ch", "2", "--latency", "20", "--flash-chip", "uc25hq80"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::carried_over(&a), ["--mhz", "320", "--usb", "--midi", "MPK", "--midi-ch", "2", "--latency", "20",
+                                              "--flash-chip", "uc25hq80"]);
+    }
     use super::*;
 
     #[test]
@@ -1851,16 +2425,72 @@ mod tests {
             vec!["--usb-mode", "host", "--disk", "disk.img", "--usb-mode", "device"],
             vec!["--usb-mode", "host"], vec!["--disk", "disk.img"],
             vec!["--usb-mode", "device", "--disk", "disk.img"],
+            vec!["--usb", "ethernet", "--usb"], vec!["--usb", "--usb", "ethernet"],
+            vec!["--usb-mode", "ethernet", "--usb-mode", "device"],
+            vec!["--usb", "disk"], vec!["--disk-image", "disk.img"], vec!["--usb", "computer", "--disk-image", "disk.img"],
+            vec!["--usb", "computer,disk", "--disk-image", "disk.img"],
+            vec!["--internet"], vec!["--internet", "--allow-lan"], vec!["--usb", "--internet"],
+            vec!["--net", "internet"], vec!["--net", "lan"], vec!["--usb", "disk", "--disk-image", "d.img", "--net", "internet"],
+            vec!["--wifi", "jieli", "--wifi", "oss"], vec!["--wifi=jieli", "--oss-wifi"],
         ] {
             assert!(check_opts(&parse_args(args(&a)).unwrap()).is_err(), "{a:?}");
         }
-        for a in [vec!["--usb"], vec!["--usb-mode", "device"],
-                  vec!["--usb-mode", "host", "--disk", "disk.img"]] {
-            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_ok());
+        for a in [vec!["--usb"], vec!["--usb-mode", "device"], vec!["--usb", "device"], vec!["--usb", "computer"],
+                  vec!["--usb-mode", "host", "--disk", "disk.img"], vec!["--usb", "disk", "--disk-image", "disk.img"],
+                  vec!["--usb=disk", "--disk-image", "disk.img"],
+                  vec!["--usb", "ethernet"], vec!["--usb=ethernet", "--internet", "--allow-lan"],
+                  vec!["--usb", "ethernet", "--net", "internet"], vec!["--usb=ethernet", "--net=lan"],
+                  vec!["--usb", "ethernet,disk", "--disk-image", "disk.img"], vec!["--usb=disk,ethernet", "--disk-image", "d.img", "--net", "lan"],
+                  vec!["--usb=ethernet", "--usb-mode", "host", "--disk", "disk.img"],
+                  vec!["--wifi", "--net", "lan"], vec!["--wifi", "oss", "--net", "offline"],
+                  vec!["--usb-mode", "ethernet"], vec!["--usb", "--bench", "10"],
+                  vec!["--wifi", "oss", "--internet"], vec!["--wifi=oss"], vec!["--oss-wifi", "--internet"],
+                  vec!["--wifi", "oss", "--usb"], vec!["--wifi", "jieli"], vec!["--wifi=jieli", "--internet"],
+                  vec!["--wifi", "jieli", "--usb", "ethernet"]] {
+            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_ok(), "{a:?}");
         }
-        for a in [vec!["--usb-mode", "bad"], vec!["--usb-mode"], vec!["--disk"]] {
-            assert!(parse_args(args(&a)).is_none());
+        let o = parse_args(args(&["--usb", "ethernet", "--wifi", "oss"])).unwrap();
+        assert!(o.usb_ethernet && o.oss_wifi && !o.usb);
+        let o = parse_args(args(&["--usb", "--bench", "10"])).unwrap();
+        assert!(o.usb && !o.usb_ethernet && o.bench == Some(10));
+        let o = parse_args(args(&["--usb", "ethernet,disk", "--disk-image", "d.img"])).unwrap();
+        assert!(o.usb_ethernet && o.usb_disk && o.disk.as_deref() == Some("d.img") && !o.usb);
+        let o = parse_args(args(&["--wifi", "--net", "lan"])).unwrap();
+        assert!(o.internet && o.allow_lan);
+        let o = parse_args(args(&["--wifi", "--net", "internet"])).unwrap();
+        assert!(o.internet && !o.allow_lan);
+        for a in [vec!["--usb-mode", "bad"], vec!["--usb-mode"], vec!["--disk"], vec!["--usb=bad"], vec!["--usb", "ethernet,"],
+                  vec!["--wifi", "bad"], vec!["--wifi=cafe"], vec!["--wifi-ssid"], vec!["--wifi-password"],
+                  vec!["--net"], vec!["--net", "wide"], vec!["--disk-image"]] {
+            assert!(parse_args(args(&a)).is_none(), "{a:?}");
         }
+        // plain --wifi is the vendor stack's view, as the flag was before it took a value
+        for a in [vec!["--wifi"], vec!["--wifi", "--internet"], vec!["--wifi", "--bench", "10"]] {
+            let o = parse_args(args(&a)).unwrap();
+            assert!(o.wifi_jieli && !o.oss_wifi, "{a:?}");
+            assert!(check_opts(&o).is_ok(), "{a:?}");
+        }
+        // the access point: a name and a WPA2 passphrase, for a chip that is there
+        let o = parse_args(args(&["--wifi", "oss", "--wifi-ssid", "Studio", "--wifi-password", "letmein12"])).unwrap();
+        assert_eq!((o.wifi_ssid.as_str(), o.wifi_password.as_str()), ("Studio", "letmein12"));
+        assert!(check_opts(&o).is_ok());
+        let o = parse_args(args(&["--wifi"])).unwrap();
+        assert_eq!((o.wifi_ssid.as_str(), o.wifi_password.as_str()), ("Home", "fm1pass"));
+        for a in [vec!["--wifi", "--wifi-password", ""], vec!["--wifi", "--wifi-ssid", ""],
+                  vec!["--wifi", "--wifi-ssid", "123456789012345678901234567890123"],
+                  vec!["--wifi-ssid", "Studio"], vec!["--usb", "ethernet", "--wifi-password", "letmein12"]] {
+            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_err(), "{a:?}");
+        }
+        assert_eq!(carried_over(&args(&["--wifi", "--wifi-ssid", "Studio", "--wifi-password", "letmein12", "--fwsc", "a"])),
+                   ["--wifi", "--wifi-ssid", "Studio", "--wifi-password", "letmein12"]);
+        assert_eq!(carried_over(&args(&["--usb", "ethernet", "--wifi", "oss", "--internet", "--fwsc", "a"])),
+                   ["--usb", "ethernet", "--wifi", "oss", "--internet"]);
+        assert_eq!(carried_over(&args(&["--usb=ethernet", "--oss-wifi", "--allow-lan"])),
+                   ["--usb=ethernet", "--oss-wifi", "--allow-lan"]);
+        // a disk is this run's; the rest of the port's list, and --net, go on to the next firmware
+        assert_eq!(carried_over(&args(&["--usb", "ethernet,disk", "--disk-image", "d.img", "--net", "lan"])),
+                   ["--usb", "ethernet", "--net", "lan"]);
+        assert_eq!(carried_over(&args(&["--usb=disk", "--disk-image", "d.img", "--net=internet"])), ["--net=internet"]);
     }
 
     #[test]

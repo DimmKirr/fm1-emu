@@ -128,6 +128,7 @@ class Fm1 extends AudioWorkletProcessor {
     if (token !== this.bootToken) return;
     // hot code compiled to WebAssembly, a few blocks per quantum at most (?jit=0: interpreter only)
     x.fm1_jit(m.jit === false ? 0 : 1, 16);
+    x.fm1_flash_part?.(m.chip === "uc25hq80" ? 1 : 0);   // ?chip=uc25hq80: the newer units' flash part
     const ahead = x.fm1_ahead ? m.ahead ?? AHEAD_FRAMES : 0;
     x.fm1_ahead?.(ahead);               // (?ahead=0: each quantum runs for its own frames only)
     // the whole update package (.fwsc): the machine unpacks it, gets the flash chip and the
@@ -151,9 +152,25 @@ class Fm1 extends AudioWorkletProcessor {
     if (m.script?.byteLength && (!x.fm1_bench_script || x.fm1_bench_script(copy(m.script), m.script.byteLength) !== 0)) {
       throw new Error("the input script did not load");
     }
-    // ?oss-wifi=1: the WiFi chip for a clean-room driver; &internet=1: the page's fetch() behind it
+    // ?wifi=oss: the WiFi chip for a clean-room driver; ?usb=ethernet: a USB network adapter;
+    // &internet=1: the page's fetch() behind the virtual subnet
+    if ((m.wifiSsid || m.wifiPassword) && x.fm1_wifi_ap) {
+      const enc = new TextEncoder();
+      const ssid = enc.encode(m.wifiSsid || "Home"), pass = enc.encode(m.wifiPassword || "fm1pass");
+      if (x.fm1_wifi_ap(copy(ssid.buffer), ssid.byteLength, copy(pass.buffer), pass.byteLength) !== 0) {
+        throw new Error("wifi-ssid / wifi-password: the SSID is 1 to 32 bytes, the passphrase 1 to 63");
+      }
+    }
     if (m.ossWifi && x.fm1_oss_wifi) {
       x.fm1_oss_wifi(m.internet ? 1 : 0);
+    }
+    if (m.vendorWifi && x.fm1_vendor_wifi) {
+      x.fm1_vendor_wifi(m.internet ? 1 : 0);
+    }
+    if (m.usbEthernet && x.fm1_usb_ethernet) {
+      x.fm1_usb_ethernet(m.internet ? 1 : 0);
+    }
+    if (m.ossWifi || m.vendorWifi || m.usbEthernet) {
       x.fm1_set_epoch?.(Math.floor(Date.now() / 1000));
     }
     this.x = x;                         // (a reboot replaces the whole instance)

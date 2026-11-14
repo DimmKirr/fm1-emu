@@ -9,8 +9,6 @@ use crate::ram::Ram;
 use crate::RAM_BASE;
 
 const AP_MAC: [u8; 6] = [0x02, 0x46, 0x4d, 0x31, 0x00, 0x01];
-const AP_SSID: &str = "Home";
-const AP_PASS: &str = "fm1pass";
 const AP_CHANNEL: u8 = 6;
 const BEACON_INTERVAL: u16 = 100;
 /// The virtual APs beacon every 100 ms of emulated time (`tick`)...
@@ -144,8 +142,20 @@ pub struct WifiHw {
     // the emulated time of the last beacons (`tick`)
     last_beacon_ms: u64,
 
-    // the virtual subnet behind the AP, and its NAT
-    pub vnet: crate::net::VirtualNet,
+    // Ethernet frames from the station, for the subnet (`crate::net::Link`)
+    tx_queue: Vec<Vec<u8>>,
+    /// The WPA2 access point: its name and passphrase (`crate::net::Ap`).
+    pub ap: crate::net::Ap,
+}
+
+impl crate::net::Link for WifiHw {
+    fn drain_tx(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.tx_queue)
+    }
+
+    fn push_rx(&mut self, eth: Vec<u8>) {
+        self.eth_to_80211(eth);
+    }
 }
 
 struct WpaAuthenticator {
@@ -201,7 +211,8 @@ impl WifiHw {
             seq_num: 0,
             wpa: None,
             last_beacon_ms: 0,
-            vnet: crate::net::VirtualNet::new(),
+            tx_queue: Vec::new(),
+            ap: crate::net::Ap::default(),
         }
     }
 
@@ -384,7 +395,8 @@ impl WifiHw {
     }
 
     fn handle_probe_req(&mut self, _frame: &[u8]) {
-        self.send_beacon_or_probe(true, AP_SSID, &AP_MAC, true);
+        let ssid = self.ap.ssid.clone();
+        self.send_beacon_or_probe(true, &ssid, &AP_MAC, true);
         self.send_beacon_or_probe(true, CAFE_SSID, &CAFE_MAC, false);
     }
 
@@ -491,10 +503,7 @@ impl WifiHw {
         eth.extend_from_slice(&ethertype);
         eth.extend_from_slice(payload);
 
-        let responses = self.vnet.handle(&eth);
-        for r in responses {
-            self.eth_to_80211(r);
-        }
+        self.tx_queue.push(eth);
     }
 
     fn eth_to_80211(&mut self, eth: Vec<u8>) {
@@ -554,7 +563,7 @@ impl WifiHw {
 
     fn start_wpa_handshake(&mut self) {
         // Derive PMK from passphrase + SSID (same as the firmware does)
-        let pmk = pbkdf2_sha1(AP_PASS.as_bytes(), AP_SSID.as_bytes(), 4096, 32);
+        let pmk = pbkdf2_sha1(self.ap.password.as_bytes(), self.ap.ssid.as_bytes(), 4096, 32);
         let mut pmk_arr = [0u8; 32];
         pmk_arr.copy_from_slice(&pmk);
 
@@ -702,20 +711,18 @@ impl WifiHw {
     }
 
     pub fn send_beacons(&mut self) {
-        self.send_beacon_or_probe(false, AP_SSID, &AP_MAC, true);
+        let ssid = self.ap.ssid.clone();
+        self.send_beacon_or_probe(false, &ssid, &AP_MAC, true);
         self.send_beacon_or_probe(false, CAFE_SSID, &CAFE_MAC, false);
     }
 
     /// The chip's tick, every 10 ms of emulated time (`Soc::advance`): the virtual APs'
-    /// beacons, whatever the NAT's host sockets delivered (as 802.11 data frames), and the
-    /// frames waiting for the station into its RX ring.
+    /// beacons, and the frames waiting for the station into its RX ring. (What the subnet
+    /// and the NAT answered came in through `Link::push_rx`, as 802.11 data frames.)
     pub fn tick(&mut self, now_ms: u64, ram: &mut Ram) {
         if now_ms.saturating_sub(self.last_beacon_ms) >= BEACON_PERIOD_MS && self.rx_queue.len() < RX_QUEUE_BEACON_CAP {
             self.last_beacon_ms = now_ms;
             self.send_beacons();
-        }
-        for r in self.vnet.poll(now_ms) {
-            self.eth_to_80211(r);
         }
         self.dma_deliver_rx(ram);
     }
