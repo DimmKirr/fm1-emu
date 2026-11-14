@@ -159,6 +159,12 @@ struct Opts {
     flash: Option<String>,
     /// --usb: a USB cable to this computer (a host; USB-MIDI as a virtual MIDI device)
     usb: bool,
+    /// --oss-wifi: the WiFi chip as a clean-room driver sees it (SDIO, BBP, MAC, a virtual AP)
+    oss_wifi: bool,
+    /// --internet: the real network behind the virtual AP (off: the firmware reaches nothing)
+    internet: bool,
+    /// --allow-lan: with --internet, this computer's own addresses and its LAN too
+    allow_lan: bool,
     /// --flash-chip NAME: which part the FM-1's flash is (the stock Puya, or the newer units' UC25HQ80)
     flash_part: fm1_soc::FlashPart,
     /// --latency MS: the audio queued ahead of the device to start with (it grows on underruns)
@@ -167,6 +173,66 @@ struct Opts {
     buffer: Option<u32>,
     /// --exclusive (Windows): the output in WASAPI exclusive mode
     exclusive: bool,
+    /// --usb disk: a flash drive on the host port (`disk`: its image, --disk-image FILE)
+    usb_disk: bool,
+    disk: Option<String>,
+    /// --usb ethernet: a USB network adapter on the host port (the virtual subnet behind it)
+    usb_ethernet: bool,
+    /// --wifi jieli (or --wifi alone): the vendor WiFi stack's view, fm1-base's plat_wifi_* mailbox
+    /// (firmware built with wifi_stack = "emu")
+    wifi_jieli: bool,
+    /// --wifi-ssid NAME, --wifi-password PASS: the virtual access point either flavour offers
+    wifi_ssid: String,
+    wifi_password: String,
+}
+
+/// Unbuffered sector I/O: a completed write is already in the backing file.
+/// The advisory OS lock is held by this handle for the entire machine lifetime.
+struct DiskImage {
+    file: std::fs::File,
+    sectors: u32,
+}
+
+impl DiskImage {
+    fn open(path: &str) -> std::io::Result<Self> {
+        let open = || -> std::io::Result<Self> {
+            let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            file.try_lock().map_err(|e| std::io::Error::other(format!("exclusive disk lock: {e}")))?;
+            let metadata = file.metadata()?;
+            let size = metadata.len();
+            if !metadata.is_file() || size == 0 || size % 512 != 0 || size / 512 > u32::MAX as u64 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                    "disk must be a nonempty regular file of 512-byte sectors, at most 2 TiB minus 512 bytes"));
+            }
+            Ok(Self { file, sectors: (size / 512) as u32 })
+        };
+        open().map_err(|e| std::io::Error::new(e.kind(), format!("{path}: {e}")))
+    }
+
+    fn seek_sector(&mut self, lba: u32) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        if lba >= self.sectors {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sector outside disk"));
+        }
+        self.file.seek(SeekFrom::Start(u64::from(lba) * 512))?;
+        Ok(())
+    }
+}
+
+impl fm1_soc::usb::SectorStorage for DiskImage {
+    fn sectors(&self) -> u32 { self.sectors }
+
+    fn read_sector(&mut self, lba: u32, data: &mut [u8; 512]) -> std::io::Result<()> {
+        use std::io::Read;
+        self.seek_sector(lba)?;
+        self.file.read_exact(data)
+    }
+
+    fn write_sector(&mut self, lba: u32, data: &[u8; 512]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.seek_sector(lba)?;
+        self.file.write_all(data)
+    }
 }
 
 /// The firmware catalog web/firmwares.json as (id, name, version, package path): each package is
@@ -195,6 +261,24 @@ fn parse() -> Option<Opts> {
 
 /// The options that only do something together: refused rather than ignored.
 fn check_opts(o: &Opts) -> Result<(), String> {
+    if o.usb && (o.usb_disk || o.usb_ethernet) {
+        return Err("--usb device (a cable to this computer: the FM-1 is the device) excludes --usb disk / ethernet (the FM-1 is the host): one role per run".into());
+    }
+    if o.usb_disk != o.disk.is_some() {
+        return Err("--usb disk needs --disk-image FILE, and --disk-image needs --usb disk".into());
+    }
+    if o.wifi_jieli && o.oss_wifi {
+        return Err("--wifi jieli and --wifi oss are two chips: one at a time".into());
+    }
+    if let Err(e) = fm1_soc::net::Ap::check(&o.wifi_ssid, &o.wifi_password) {
+        return Err(format!("--wifi-ssid / --wifi-password: {e}"));
+    }
+    if (o.wifi_ssid != "Home" || o.wifi_password != "fm1pass") && !(o.oss_wifi || o.wifi_jieli) {
+        return Err("--wifi-ssid / --wifi-password need a WiFi chip: --wifi oss or --wifi jieli".into());
+    }
+    if o.internet && !(o.oss_wifi || o.wifi_jieli || o.usb_ethernet) {
+        return Err("--net internet needs a link to reach it through: --wifi oss, --wifi jieli or --usb ethernet".into());
+    }
     if o.seed.is_some() && o.flaky_core1.is_none() {
         return Err("--seed needs --flaky-core1 (it seeds its misreads)".into());
     }
@@ -208,11 +292,79 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        record: None, lcd_only: false, name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
                        flaky_core1: None, cpu1_survives: false, seed: None, flash: None, usb: false, flash_part: fm1_soc::FlashPart::P25q80,
-                       latency_ms: AUDIO_TARGET_DEFAULT_MS, buffer: None, exclusive: false };
+                       latency_ms: AUDIO_TARGET_DEFAULT_MS, buffer: None, exclusive: false,
+                       oss_wifi: false, internet: false, allow_lan: false,
+                       usb_disk: false, disk: None, usb_ethernet: false, wifi_jieli: false,
+                       wifi_ssid: "Home".into(), wifi_password: "fm1pass".into() };
     let mut i = 1;
     while i < a.len() {
-        if a[i] == "--usb" {
-            o.usb = true;
+        if a[i] == "--usb" || a[i].starts_with("--usb=") {
+            // --usb WHAT: the port's role and what is there. "device" (plain --usb; "computer" too):
+            // a cable to this computer, the FM-1 the device. Else the FM-1 is the host, with one or
+            // more of "ethernet" and "disk" on the port, comma-separated (two or more sit behind a
+            // hub, as on the dock).
+            let value = match a[i].strip_prefix("--usb=") {
+                Some(v) => v.to_string(),
+                None => match a.get(i + 1).filter(|v| !v.starts_with("--")) {
+                    Some(v) => { i += 1; v.clone() }
+                    None => "device".into(),
+                },
+            };
+            for what in value.split(',') {
+                match what {
+                    "device" | "computer" => o.usb = true,
+                    "ethernet" => o.usb_ethernet = true,
+                    "disk" => o.usb_disk = true,
+                    _ => return None,
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if a[i] == "--net" || a[i].starts_with("--net=") {
+            // --net internet|lan: how far the subnet reaches (absent: offline)
+            let value = match a[i].strip_prefix("--net=") {
+                Some(v) => v.to_string(),
+                None => { i += 1; a.get(i)?.clone() }
+            };
+            match value.as_str() {
+                "offline" => (o.internet, o.allow_lan) = (false, false),
+                "internet" => o.internet = true,
+                "lan" => (o.internet, o.allow_lan) = (true, true),
+                _ => return None,
+            }
+            i += 1;
+            continue;
+        }
+        if a[i] == "--wifi" || a[i].starts_with("--wifi=") {
+            // --wifi jieli (the vendor stack's view, also plain --wifi), --wifi oss (the clean-room driver's chip)
+            let value = match a[i].strip_prefix("--wifi=") {
+                Some(v) => v.to_string(),
+                None => match a.get(i + 1).filter(|v| !v.starts_with("--")) {
+                    Some(v) => { i += 1; v.clone() }
+                    None => "jieli".into(),
+                },
+            };
+            match value.as_str() {
+                "oss" => o.oss_wifi = true,
+                "jieli" => o.wifi_jieli = true,
+                _ => return None,
+            }
+            i += 1;
+            continue;
+        }
+        if a[i] == "--oss-wifi" {
+            o.oss_wifi = true;
+            i += 1;
+            continue;
+        }
+        if a[i] == "--internet" {
+            o.internet = true;
+            i += 1;
+            continue;
+        }
+        if a[i] == "--allow-lan" {
+            o.allow_lan = true;
             i += 1;
             continue;
         }
@@ -227,6 +379,16 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
             continue;
         }
         match a[i].as_str() {
+            // (the older spellings: --usb-mode device|host|ethernet, --disk FILE)
+            "--usb-mode" => match a.get(i + 1)?.as_str() {
+                "device" => o.usb = true,
+                "host" => o.usb_disk = true,
+                "ethernet" => o.usb_ethernet = true,
+                _ => return None,
+            },
+            "--disk" | "--disk-image" => o.disk = Some(a.get(i + 1)?.clone()),
+            "--wifi-ssid" => o.wifi_ssid = a.get(i + 1)?.clone(),
+            "--wifi-password" => o.wifi_password = a.get(i + 1)?.clone(),
             "--bin" => {
                 o.bin = a.get(i + 1)?.clone();
                 o.name = o.bin.rsplit('/').next().unwrap_or("").trim_end_matches(".bin").trim_end_matches(".xip").to_string();
@@ -293,6 +455,8 @@ struct Machine {
 
 impl Machine {
     fn new(o: &Opts) -> std::io::Result<Self> {
+        check_opts(o).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let disk = o.disk.as_deref().map(DiskImage::open).transpose()?;
         let stock = match &o.fwsc {
             Some(path) => {
                 let syx = o.syx.as_ref().map(std::fs::read).transpose()?;
@@ -353,6 +517,27 @@ impl Machine {
         }
         if o.usb {
             soc.usb_plug();
+        }
+        soc.set_wifi_ap(fm1_soc::net::Ap { ssid: o.wifi_ssid.clone(), password: o.wifi_password.clone() });
+        if o.oss_wifi {
+            soc.enable_oss_wifi();
+        }
+        if o.wifi_jieli {
+            soc.enable_vendor_wifi();
+        }
+        // what hangs off the host port: one device on the cable, two behind a hub as on the dock
+        let mut devices: Vec<fm1_soc::usb::Attachment> = Vec::new();
+        if let Some(disk) = disk {
+            devices.push(fm1_soc::usb::Attachment::Disk(Box::new(disk)));
+        }
+        if o.usb_ethernet {
+            devices.push(fm1_soc::usb::Attachment::Ethernet);
+        }
+        if !devices.is_empty() {
+            soc.usb_attach(devices);
+        }
+        if o.internet {
+            soc.enable_internet(o.allow_lan);
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -1337,7 +1522,16 @@ const DRAG_PER_CLICK: f32 = 12.0;
 const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package: a community firmware, or M-VAVE's own)
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
-options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE] [--usb]
+options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE]
+         [--usb device | --usb ethernet | --usb disk --disk-image FILE]   the USB port's role and what is there
+                      device (plain --usb): a cable to this computer, the FM-1 the device (USB-MIDI, USB audio,
+                      whatever the firmware offers); else the FM-1 is the host: a CDC-ECM Ethernet adapter, or a
+                      flash drive (its image opened writable, never created or truncated, exclusively locked:
+                      do not mount or edit it during a run). disk,ethernet together: both behind a hub, as on
+                      the dock. One role per run
+         [--net internet | --net lan]   how far the network behind --wifi / --usb ethernet reaches: the real
+                      network through a NAT over this computer's sockets (off by default: a firmware reaches
+                      nothing outside the emulator); lan adds this computer's own addresses and its LAN
          [--latency MS] (12 on Windows, else 50)
                                  audio queued ahead of the device to start with; it grows by itself
                                  on underruns and back down after 10 s without one, no lower
@@ -1349,6 +1543,15 @@ options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--fl
                                  the FM-1's flash part: the stock Puya P25Q80 (85 60 14), or the
                                  UC25HQ80 (B3 60 14) of units sold since autumn 2026
          [--flaky-core1 RATE [--seed N]] [--cpu1-survives] [--version] [--help]
+         [--wifi oss]  the WiFi chip for a clean-room driver (modd's): a virtual AP \"Home\" and the subnet
+                      behind it (DHCP, DNS, SNTP), an open \"Cafe\" beside it
+         [--wifi jieli]  the vendor stack's view instead (plain --wifi is this): the plat_wifi_* mailbox an
+                      fm1-base firmware built with wifi_stack = \"emu\" talks to (JieLi's binary driver itself
+                      is not emulated: a firmware linking it finds no chip), the same APs and subnet
+         [--wifi-ssid NAME] [--wifi-password PASS]  the WPA2 access point either flavour offers (Home / fm1pass):
+                      a driver joins with these or not at all; an open \"Cafe\" is around too
+         (--oss-wifi, --internet, --allow-lan, --usb-mode device|host|ethernet, --disk FILE: the older
+                      spellings of --wifi oss, --net internet, --net lan, --usb ..., --disk-image; still taken)
 headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
           --shot MS    run MS ms, then write the panel to work/panel.ppm
           --record DIR with --shot: a PPM frame every 16 ms (62.5 fps) as DIR/000000.ppm…, and the audio
@@ -1414,18 +1617,45 @@ fn open_another() -> Option<Vec<String>> {
 /// new one never loads or overwrites the old one's flash.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn carried_over(args: &[String]) -> Vec<String> {
-    const WITH_VALUE: [&str; 7] = ["--mhz", "--midi", "--midi-ch", "--latency", "--buffer", "--map", "--flash-chip"];
-    const FLAGS: [&str; 3] = ["--usb", "--exclusive", "--midi-log"];
+    const WITH_VALUE: [&str; 11] = ["--mhz", "--midi", "--midi-ch", "--latency", "--buffer", "--map", "--flash-chip", "--wifi",
+                                    "--wifi-ssid", "--wifi-password", "--net"];
+    const FLAGS: [&str; 6] = ["--usb", "--exclusive", "--midi-log", "--oss-wifi", "--internet", "--allow-lan"];
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if WITH_VALUE.contains(&a) && i + 1 < args.len() {
+        // (a disk's image is this run's: --usb disk is not carried, --usb ethernet / computer are)
+        let next_is_value = i + 1 < args.len() && !args[i + 1].starts_with("--");
+        if a == "--usb" && next_is_value {
+            let kept: Vec<&str> = args[i + 1].split(',').filter(|w| *w != "disk").collect();
+            if !kept.is_empty() {
+                out.push(args[i].clone());
+                out.push(kept.join(","));
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--usb=") {
+            let kept: Vec<&str> = v.split(',').filter(|w| *w != "disk").collect();
+            if !kept.is_empty() {
+                out.push(format!("--usb={}", kept.join(",")));
+            }
+            i += 1;
+            continue;
+        }
+        let usb_with_value = false;
+        let bare_wifi = a == "--wifi" && !next_is_value;
+        if bare_wifi {
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        if (WITH_VALUE.contains(&a) || usb_with_value) && i + 1 < args.len() {
             out.extend_from_slice(&args[i..i + 2]);
             i += 2;
             continue;
         }
-        if FLAGS.contains(&a) {
+        if FLAGS.contains(&a) || a.starts_with("--wifi=") || a.starts_with("--net=") {
             out.push(args[i].clone());
         }
         i += 1;
@@ -2172,6 +2402,118 @@ mod tests {
                                               "--flash-chip", "uc25hq80"]);
     }
     use super::*;
+
+    #[test]
+    fn usb_roles_are_exclusive_in_either_order() {
+        for a in [
+            vec!["--usb", "--usb-mode", "host", "--disk", "disk.img"],
+            vec!["--usb-mode", "host", "--disk", "disk.img", "--usb"],
+            vec!["--usb-mode", "device", "--usb-mode", "host", "--disk", "disk.img"],
+            vec!["--usb-mode", "host", "--disk", "disk.img", "--usb-mode", "device"],
+            vec!["--usb-mode", "host"], vec!["--disk", "disk.img"],
+            vec!["--usb-mode", "device", "--disk", "disk.img"],
+            vec!["--usb", "ethernet", "--usb"], vec!["--usb", "--usb", "ethernet"],
+            vec!["--usb-mode", "ethernet", "--usb-mode", "device"],
+            vec!["--usb", "disk"], vec!["--disk-image", "disk.img"], vec!["--usb", "computer", "--disk-image", "disk.img"],
+            vec!["--usb", "computer,disk", "--disk-image", "disk.img"],
+            vec!["--internet"], vec!["--internet", "--allow-lan"], vec!["--usb", "--internet"],
+            vec!["--net", "internet"], vec!["--net", "lan"], vec!["--usb", "disk", "--disk-image", "d.img", "--net", "internet"],
+            vec!["--wifi", "jieli", "--wifi", "oss"], vec!["--wifi=jieli", "--oss-wifi"],
+        ] {
+            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_err(), "{a:?}");
+        }
+        for a in [vec!["--usb"], vec!["--usb-mode", "device"], vec!["--usb", "device"], vec!["--usb", "computer"],
+                  vec!["--usb-mode", "host", "--disk", "disk.img"], vec!["--usb", "disk", "--disk-image", "disk.img"],
+                  vec!["--usb=disk", "--disk-image", "disk.img"],
+                  vec!["--usb", "ethernet"], vec!["--usb=ethernet", "--internet", "--allow-lan"],
+                  vec!["--usb", "ethernet", "--net", "internet"], vec!["--usb=ethernet", "--net=lan"],
+                  vec!["--usb", "ethernet,disk", "--disk-image", "disk.img"], vec!["--usb=disk,ethernet", "--disk-image", "d.img", "--net", "lan"],
+                  vec!["--usb=ethernet", "--usb-mode", "host", "--disk", "disk.img"],
+                  vec!["--wifi", "--net", "lan"], vec!["--wifi", "oss", "--net", "offline"],
+                  vec!["--usb-mode", "ethernet"], vec!["--usb", "--bench", "10"],
+                  vec!["--wifi", "oss", "--internet"], vec!["--wifi=oss"], vec!["--oss-wifi", "--internet"],
+                  vec!["--wifi", "oss", "--usb"], vec!["--wifi", "jieli"], vec!["--wifi=jieli", "--internet"],
+                  vec!["--wifi", "jieli", "--usb", "ethernet"]] {
+            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_ok(), "{a:?}");
+        }
+        let o = parse_args(args(&["--usb", "ethernet", "--wifi", "oss"])).unwrap();
+        assert!(o.usb_ethernet && o.oss_wifi && !o.usb);
+        let o = parse_args(args(&["--usb", "--bench", "10"])).unwrap();
+        assert!(o.usb && !o.usb_ethernet && o.bench == Some(10));
+        let o = parse_args(args(&["--usb", "ethernet,disk", "--disk-image", "d.img"])).unwrap();
+        assert!(o.usb_ethernet && o.usb_disk && o.disk.as_deref() == Some("d.img") && !o.usb);
+        let o = parse_args(args(&["--wifi", "--net", "lan"])).unwrap();
+        assert!(o.internet && o.allow_lan);
+        let o = parse_args(args(&["--wifi", "--net", "internet"])).unwrap();
+        assert!(o.internet && !o.allow_lan);
+        for a in [vec!["--usb-mode", "bad"], vec!["--usb-mode"], vec!["--disk"], vec!["--usb=bad"], vec!["--usb", "ethernet,"],
+                  vec!["--wifi", "bad"], vec!["--wifi=cafe"], vec!["--wifi-ssid"], vec!["--wifi-password"],
+                  vec!["--net"], vec!["--net", "wide"], vec!["--disk-image"]] {
+            assert!(parse_args(args(&a)).is_none(), "{a:?}");
+        }
+        // plain --wifi is the vendor stack's view, as the flag was before it took a value
+        for a in [vec!["--wifi"], vec!["--wifi", "--internet"], vec!["--wifi", "--bench", "10"]] {
+            let o = parse_args(args(&a)).unwrap();
+            assert!(o.wifi_jieli && !o.oss_wifi, "{a:?}");
+            assert!(check_opts(&o).is_ok(), "{a:?}");
+        }
+        // the access point: a name and a WPA2 passphrase, for a chip that is there
+        let o = parse_args(args(&["--wifi", "oss", "--wifi-ssid", "Studio", "--wifi-password", "letmein12"])).unwrap();
+        assert_eq!((o.wifi_ssid.as_str(), o.wifi_password.as_str()), ("Studio", "letmein12"));
+        assert!(check_opts(&o).is_ok());
+        let o = parse_args(args(&["--wifi"])).unwrap();
+        assert_eq!((o.wifi_ssid.as_str(), o.wifi_password.as_str()), ("Home", "fm1pass"));
+        for a in [vec!["--wifi", "--wifi-password", ""], vec!["--wifi", "--wifi-ssid", ""],
+                  vec!["--wifi", "--wifi-ssid", "123456789012345678901234567890123"],
+                  vec!["--wifi-ssid", "Studio"], vec!["--usb", "ethernet", "--wifi-password", "letmein12"]] {
+            assert!(check_opts(&parse_args(args(&a)).unwrap()).is_err(), "{a:?}");
+        }
+        assert_eq!(carried_over(&args(&["--wifi", "--wifi-ssid", "Studio", "--wifi-password", "letmein12", "--fwsc", "a"])),
+                   ["--wifi", "--wifi-ssid", "Studio", "--wifi-password", "letmein12"]);
+        assert_eq!(carried_over(&args(&["--usb", "ethernet", "--wifi", "oss", "--internet", "--fwsc", "a"])),
+                   ["--usb", "ethernet", "--wifi", "oss", "--internet"]);
+        assert_eq!(carried_over(&args(&["--usb=ethernet", "--oss-wifi", "--allow-lan"])),
+                   ["--usb=ethernet", "--oss-wifi", "--allow-lan"]);
+        // a disk is this run's; the rest of the port's list, and --net, go on to the next firmware
+        assert_eq!(carried_over(&args(&["--usb", "ethernet,disk", "--disk-image", "d.img", "--net", "lan"])),
+                   ["--usb", "ethernet", "--net", "lan"]);
+        assert_eq!(carried_over(&args(&["--usb=disk", "--disk-image", "d.img", "--net=internet"])), ["--net=internet"]);
+    }
+
+    #[test]
+    fn disk_image_is_exclusive_bounded_and_persistent() {
+        use fm1_soc::usb::SectorStorage;
+        let path = std::env::temp_dir().join(format!("fm1-usb-disk-{}.img", std::process::id()));
+        let name = path.to_str().unwrap();
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        file.set_len(1024).unwrap();
+        drop(file);
+        let mut disk = DiskImage::open(name).unwrap();
+        assert_eq!(disk.sectors(), 2);
+        assert!(DiskImage::open(name).is_err());
+        let first = [0xa5; 512];
+        let second = [0x3c; 512];
+        disk.write_sector(0, &first).unwrap();
+        disk.write_sector(1, &second).unwrap();
+        assert!(disk.write_sector(2, &first).is_err());
+        drop(disk);
+        let mut reopened = DiskImage::open(name).unwrap();
+        let mut read = [0; 512];
+        reopened.read_sector(0, &mut read).unwrap();
+        assert_eq!(read, first);
+        reopened.read_sector(1, &mut read).unwrap();
+        assert_eq!(read, second);
+        assert!(reopened.read_sector(u32::MAX, &mut read).is_err());
+        drop(reopened);
+        std::fs::write(&path, [0; 513]).unwrap();
+        assert!(DiskImage::open(name).is_err());
+        std::fs::write(&path, []).unwrap();
+        assert!(DiskImage::open(name).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let error = DiskImage::open(name).err().unwrap().to_string();
+        assert!(error.contains(name));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn rgb565_expands_to_the_full_range() {
