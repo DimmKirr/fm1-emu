@@ -41,7 +41,11 @@
 //! SPDX-License-Identifier: MIT
 
 use std::collections::VecDeque;
+mod ethernet;
+mod hub;
 mod msc;
+use ethernet::EthDevice;
+use hub::HubDevice;
 use msc::MscDevice;
 
 pub const USB_LO: u32 = 0x11800;
@@ -262,8 +266,11 @@ pub struct Usb {
     /// A cable to a host: without it the SIE never answers and nothing happens on the bus.
     pub cable: bool,
     /// An attached peripheral is distinct from the virtual computer (`cable`).
-    disk: Option<MscDevice>,
+    peer: Option<Peer>,
     devctl: u8,
+    /// MUSB's per-endpoint hub routing (TXFUNCADDR.. at 0x80 + 8 * ep): kept for the driver to
+    /// read back; the hub model routes by address.
+    hub_route: [[u8; 8]; 8],
     packets: [Option<Packet>; NEP * 2],
     packet_cycles: u64,
     /// CPU cycles per SIE round trip.
@@ -320,10 +327,89 @@ pub struct Usb {
     pub in_packets: u64,
 }
 
+/// What to plug into the FM-1's host port (`Usb::attach_devices`): one device sits on the cable
+/// itself, two or more behind a hub, as on the dock.
+pub enum Attachment {
+    Disk(Box<dyn SectorStorage>),
+    Ethernet,
+}
+
+/// What hangs off the FM-1's host port.
+enum Peer {
+    Disk(MscDevice),
+    Ethernet(EthDevice),
+    Hub(HubDevice),
+}
+
+impl Peer {
+    fn address(&self) -> u8 {
+        match self { Peer::Disk(d) => d.address, Peer::Ethernet(e) => e.address, Peer::Hub(h) => h.address }
+    }
+    fn reset(&mut self) {
+        match self { Peer::Disk(d) => d.reset(), Peer::Ethernet(e) => e.reset(), Peer::Hub(h) => h.reset() }
+    }
+    fn setup(&mut self, packet: &[u8]) -> Reply {
+        match self { Peer::Disk(d) => d.setup(packet), Peer::Ethernet(e) => e.setup(packet), Peer::Hub(h) => h.setup(packet) }
+    }
+    fn control_in(&mut self, status: bool) -> Reply {
+        match self { Peer::Disk(d) => d.control_in(status), Peer::Ethernet(e) => e.control_in(status), Peer::Hub(h) => h.control_in(status) }
+    }
+    fn control_out(&mut self, data: &[u8], status: bool) -> Reply {
+        match self {
+            Peer::Disk(d) => d.control_out(data, status), Peer::Ethernet(e) => e.control_out(data, status),
+            Peer::Hub(h) => h.control_out(data, status),
+        }
+    }
+    fn bulk_in(&mut self, ep: u8) -> Reply {
+        match self { Peer::Disk(d) => d.bulk_in(ep), Peer::Ethernet(e) => e.bulk_in(ep), Peer::Hub(h) => h.bulk_in(ep) }
+    }
+    fn bulk_out(&mut self, ep: u8, data: &[u8]) -> Reply {
+        match self { Peer::Disk(d) => d.bulk_out(ep, data), Peer::Ethernet(e) => e.bulk_out(ep, data), Peer::Hub(h) => h.bulk_out(ep, data) }
+    }
+    /// Configured with its link or medium ready (a hub: any of its devices).
+    fn up(&self) -> bool {
+        match self {
+            Peer::Disk(d) => d.address != 0,
+            Peer::Ethernet(e) => e.up(),
+            Peer::Hub(h) => h.children.iter().any(Peer::up),
+        }
+    }
+    /// The network adapter in here, if any.
+    fn ethernet_mut(&mut self) -> Option<&mut EthDevice> {
+        match self {
+            Peer::Ethernet(e) => Some(e),
+            Peer::Hub(h) => h.children.iter_mut().find_map(Peer::ethernet_mut),
+            Peer::Disk(_) => None,
+        }
+    }
+    /// What was plugged in, to plug in again (a disk keeps its open medium).
+    fn into_attachments(self) -> Vec<Attachment> {
+        match self {
+            Peer::Disk(d) => vec![Attachment::Disk(d.storage)],
+            Peer::Ethernet(_) => vec![Attachment::Ethernet],
+            Peer::Hub(h) => h.children.into_iter().flat_map(Peer::into_attachments).collect(),
+        }
+    }
+    /// Whom a transaction to `address` reaches in here.
+    fn route(&mut self, address: u8) -> Option<&mut Peer> {
+        let mine = match &*self {
+            Peer::Hub(h) => h.is_me(address),
+            p => p.address() == address,
+        };
+        if mine {
+            return Some(self);
+        }
+        match self {
+            Peer::Hub(h) => h.route(address),
+            _ => None,
+        }
+    }
+}
+
 impl Usb {
     /// The cable in, to a host, with the CPU at `hz`.
     pub fn plug(&mut self, hz: u64) {
-        self.disk = None;
+        self.peer = None;
         let ns = std::env::var("FM1_USB_SIE_NS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1000);
         self.cable = true;
         self.sie_cycles = (hz * ns / 1_000_000_000).max(1);
@@ -333,22 +419,60 @@ impl Usb {
 
     /// Attach a disk without starting a guest host session or supplying external VBUS.
     pub fn attach_disk(&mut self, disk: Box<dyn SectorStorage>, hz: u64) {
+        self.attach_devices(vec![Attachment::Disk(disk)], hz);
+    }
+
+    /// Attach a USB Ethernet adapter (usb/ethernet.rs), likewise.
+    pub fn attach_ethernet(&mut self, hz: u64) {
+        self.attach_devices(vec![Attachment::Ethernet], hz);
+    }
+
+    /// Plug `devices` into the host port: one on the cable itself, two or more behind a hub
+    /// (usb/hub.rs), as on the dock. Nothing: the port is empty.
+    pub fn attach_devices(&mut self, devices: Vec<Attachment>, hz: u64) {
         self.plug(hz); // common clock/trace configuration
         self.cable = false;
-        self.disk = Some(MscDevice::new(disk));
+        let mut peers: Vec<Peer> = devices.into_iter().map(|d| match d {
+            Attachment::Disk(disk) => Peer::Disk(MscDevice::new(disk)),
+            Attachment::Ethernet => Peer::Ethernet(EthDevice::new()),
+        }).collect();
+        self.peer = match peers.len() {
+            0 => None,
+            1 => peers.pop(),
+            _ => Some(Peer::Hub(HubDevice::new(peers))),
+        };
         self.sie_reset();
     }
 
-    fn host_session(&self) -> bool {
-        self.disk.is_some() && self.devctl & 1 != 0 && self.sie_on()
+    /// The network adapter on the host port (on the cable or behind the hub), if any: the SoC
+    /// pumps its frames to and from the virtual subnet.
+    pub(crate) fn ethernet_mut(&mut self) -> Option<&mut dyn crate::net::Link> {
+        self.peer.as_mut().and_then(Peer::ethernet_mut).map(|e| e as &mut dyn crate::net::Link)
     }
 
-    /// Retain the configured peer and its open storage across a chip reset.
+    /// Is a USB Ethernet adapter on the host port?
+    pub fn has_ethernet(&self) -> bool {
+        fn find(p: &Peer) -> bool {
+            match p { Peer::Ethernet(_) => true, Peer::Hub(h) => h.children.iter().any(find), Peer::Disk(_) => false }
+        }
+        self.peer.as_ref().is_some_and(find)
+    }
+
+    /// Is a peer on the host port, and is it configured with its link or medium ready?
+    pub fn peer_up(&self) -> Option<bool> {
+        self.peer.as_ref().map(Peer::up)
+    }
+
+    fn host_session(&self) -> bool {
+        self.peer.is_some() && self.devctl & 1 != 0 && self.sie_on()
+    }
+
+    /// Retain the configured peer (and a disk's open storage) across a chip reset.
     pub fn keep_attachment(&mut self, old: &mut Usb, hz: u64) {
-        if let Some(disk) = old.disk.take() {
-            self.attach_disk(disk.storage, hz);
-        } else if old.cable {
-            self.plug(hz);
+        match old.peer.take() {
+            Some(peer) => self.attach_devices(peer.into_attachments(), hz),
+            None if old.cable => self.plug(hz),
+            None => {}
         }
     }
 
@@ -372,7 +496,7 @@ impl Usb {
     }
 
     fn sie_on(&self) -> bool {
-        (self.cable || self.disk.is_some()) && self.con0() & 4 != 0
+        (self.cable || self.peer.is_some()) && self.con0() & 4 != 0
     }
 
     fn sie_pending(&self) -> bool {
@@ -392,13 +516,13 @@ impl Usb {
 
     /// CON0's pending flags and CON1's done bit can change as USB runs.
     pub fn pure(&self, addr: u32) -> bool {
-        !(self.cable || self.disk.is_some()) || !matches!(addr - USB_LO, 0 | 4)
+        !(self.cable || self.peer.is_some()) || !matches!(addr - USB_LO, 0 | 4)
     }
 
     pub fn read(&mut self, addr: u32, now: u64) -> u32 {
         let i = ((addr - USB_LO) / 4) as usize;
         match i {
-            0 if self.disk.is_some() => {
+            0 if self.peer.is_some() => {
                 let line = self.host_session() && self.power & 8 == 0;
                 (self.regs[0] & !(3 << 16)) | (u32::from(line) << 16)
             }
@@ -428,7 +552,8 @@ impl Usb {
                 }
                 self.sie_accesses += 1;
                 self.sie_done_at = now.saturating_add(self.sie_cycles);
-                let r = (v >> 8) & 0x3f;
+                // the register: bits 8..23 but the read flag (modd's hub routing registers sit at 0x80..)
+                let r = ((v >> 8) & 0xffff) & !0x40;
                 if v & 0x4000 != 0 {
                     self.sie_data = self.sie_read(r);
                 } else {
@@ -441,7 +566,7 @@ impl Usb {
     }
 
     fn sie_reset(&mut self) {
-        self.reset_disk_bus();
+        self.reset_peer_bus();
         self.devctl = 0;
         self.faddr = 0;
         self.power = 0;
@@ -452,9 +577,9 @@ impl Usb {
         self.ep = [Ep::default(); NEP];
     }
 
-    fn reset_disk_bus(&mut self) {
+    fn reset_peer_bus(&mut self) {
         self.packets.fill(None);
-        if let Some(d) = &mut self.disk { d.reset(); }
+        if let Some(d) = &mut self.peer { d.reset(); }
         self.ep = [Ep::default(); NEP];
         self.intrtx = 0;
         self.intrrx = 0;
@@ -487,9 +612,8 @@ impl Usb {
             let enabled = self.host_session() && self.power & 8 == 0 && p.dma_enabled && self.ep_dma(n);
             let reply = if !enabled || !p.bulk || (!input && p.len > 64) {
                 Reply::Silent
-            } else if let Some(d) = &mut self.disk {
-                if p.address != d.address { Reply::Silent }
-                else if input {
+            } else if let Some(d) = self.peer.as_mut().and_then(|peer| peer.route(p.address)) {
+                if input {
                     if n == 0 { d.control_in(p.status) } else { d.bulk_in(p.target) }
                 } else {
                     let bytes: Vec<u8> = (0..p.len).map(|i| dma.dma_read8(p.dma.wrapping_add(i as u32))).collect();
@@ -655,6 +779,7 @@ impl Usb {
             S_RXTYPE => e.rxtype,
             S_TXINTERVAL => e.txinterval,
             S_RXINTERVAL => e.rxinterval,
+            0x80..=0xbf => self.hub_route[((r - 0x80) / 8) as usize][(r % 8) as usize],
             _ => 0,
         }
     }
@@ -668,7 +793,7 @@ impl Usb {
         match r {
             S_FADDR => self.faddr = v & 0x7f,
             S_POWER => {
-                if self.disk.is_some() && v & 8 != 0 && self.power & 8 == 0 { self.reset_disk_bus(); }
+                if self.peer.is_some() && v & 8 != 0 && self.power & 8 == 0 { self.reset_peer_bus(); }
                 self.power = v;
             }
             S_INTRTX1E => self.intrtxe = (self.intrtxe & 0xff00) | v as u16,
@@ -679,8 +804,8 @@ impl Usb {
             S_INDEX => self.index = v & 0xf,
             S_DEVCTL => {
                 self.devctl = v & 3;
-                if self.devctl & 1 == 0 && self.disk.is_some() {
-                    self.reset_disk_bus();
+                if self.devctl & 1 == 0 && self.peer.is_some() {
+                    self.reset_peer_bus();
                 }
             }
             S_TXMAXP => self.ep[n].txmaxp = v,
@@ -738,6 +863,7 @@ impl Usb {
             S_RXTYPE => self.ep[n].rxtype = v,
             S_TXINTERVAL => self.ep[n].txinterval = v,
             S_RXINTERVAL => self.ep[n].rxinterval = v,
+            0x80..=0xbf => self.hub_route[((r - 0x80) / 8) as usize][(r % 8) as usize] = v,
             _ => {}
         }
     }
@@ -937,7 +1063,7 @@ impl Usb {
 
     /// One millisecond on the bus. `pullup`: USB_IO_CON0 bit 6.
     pub fn frame(&mut self, dma: &mut dyn Dma, pullup: bool) {
-        if self.disk.is_some() {
+        if self.peer.is_some() {
             if self.host_session() && self.power & 8 == 0 {
                 self.frame = (self.frame + 1) & 0x7ff;
                 self.regs[0] |= 1 << 13;
@@ -1415,14 +1541,141 @@ mod tests {
         usb.sie_write(S_DEVCTL, 3);
         usb.write(USB_LO, 0, 0);
         assert_eq!(usb.devctl, 0);
-        assert!(usb.disk.is_some());
+        assert!(usb.peer.is_some());
         let mut reset = Usb::default();
         reset.keep_attachment(&mut usb, 240_000_000);
         reset.write(USB_LO, 5, 0);
         assert!(reset.sie_on());
         assert!(!reset.cable);
         assert_eq!(reset.sie_read(S_DEVCTL), 0);
-        assert_eq!(reset.disk.as_ref().unwrap().storage.sectors(), 1);
+        let Some(Peer::Disk(d)) = reset.peer.as_ref() else { panic!("the disk went") };
+        assert_eq!(d.storage.sectors(), 1);
+    }
+
+    /// A USB Ethernet adapter on the host port, enumerated and configured as modd's usbnet_ecm
+    /// does it; a DHCP DISCOVER over its bulk OUT reaches the virtual subnet (through `Link`),
+    /// and the OFFER comes back over bulk IN, packet by packet.
+    #[test]
+    fn ethernet_adapter_links_the_host_port_to_the_subnet() {
+        use crate::net::{Link, VirtualNet};
+        let mut usb = Usb::default();
+        usb.attach_ethernet(240_000_000);
+        assert_eq!(usb.peer_up(), Some(false));
+        assert!(!usb.cable && usb.ethernet_mut().is_some());
+        usb.write(USB_LO, 5, 0);
+        assert_eq!(usb.read(USB_LO, 0) & (3 << 16), 0, "no session yet");
+        usb.sie_write(S_DEVCTL, 3);
+        assert_eq!(usb.read(USB_LO, 0) & (3 << 16), 1 << 16, "the line is up with a peer and a session");
+        let Some(Peer::Ethernet(e)) = usb.peer.as_mut() else { panic!("no adapter") };
+        ethernet::tests::enumerate(e);
+        assert_eq!(usb.peer_up(), Some(true));
+        let Some(Peer::Ethernet(e)) = usb.peer.as_mut() else { panic!("no adapter") };
+        // a DHCP DISCOVER from the station, as lwIP sends it: 342 bytes, 5 full packets and 22
+        let mut discover = vec![0xff; 6];
+        discover.extend(ethernet::MAC);
+        discover.extend([8, 0, 0x45, 0, 0x01, 0x48, 0, 0, 0, 0, 0x40, 0x11, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255]);
+        discover.extend([0, 68, 0, 67, 0x01, 0x34, 0, 0]);
+        discover.extend([1, 1, 6, 0, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]);
+        discover.extend([0; 16]);
+        discover.extend(ethernet::MAC);
+        discover.extend([0; 10 + 192]);
+        discover.extend([0x63, 0x82, 0x53, 0x63, 53, 1, 1, 255]);
+        discover.resize(342, 0);
+        for chunk in discover.chunks(64) {
+            assert_eq!(e.bulk_out(2, chunk), Reply::Ack);
+        }
+        let mut net = VirtualNet::new();
+        let sent = e.drain_tx();
+        assert_eq!(sent, vec![discover.clone()]);
+        for f in &sent {
+            for r in net.handle(f) {
+                e.push_rx(r);
+            }
+        }
+        assert_eq!(net.stats.dhcp_acks, 1, "the subnet answered the DISCOVER");
+        let mut offer = Vec::new();
+        loop {
+            match e.bulk_in(1) {
+                Reply::Data(p) => {
+                    let short = p.len() < 64;
+                    offer.extend(p);
+                    if short { break; }
+                }
+                other => panic!("{other:?} with {} bytes read", offer.len()),
+            }
+        }
+        let eth = &offer[..];
+        assert_eq!(&eth[..6], &ethernet::MAC, "to the station");
+        assert_eq!(&eth[12..14], &[8, 0]);
+        assert_eq!(&eth[14 + 20 + 8 + 16..14 + 20 + 8 + 20], &[10, 0, 2, 15], "yiaddr");
+        assert_eq!(e.bulk_in(1), Reply::Nak, "nothing more");
+        assert_eq!((e.frames_out, e.frames_in), (1, 1));
+        // a chip reset keeps the adapter (its session is the firmware's to start again)
+        let mut reset = Usb::default();
+        reset.keep_attachment(&mut usb, 240_000_000);
+        assert_eq!(reset.peer_up(), Some(false));
+        assert!(usb.peer.is_none());
+    }
+
+    /// Two devices on the host port sit behind a hub, as on the dock: the hub answers at the
+    /// default address first; a port reset puts its device there until the host addresses it;
+    /// then the disk and the adapter answer at their own addresses, and a chip reset keeps all
+    /// of it (the disk its open medium).
+    #[test]
+    fn two_devices_on_the_host_port_sit_behind_a_hub() {
+        use crate::net::Link;
+        let mut usb = Usb::default();
+        usb.attach_devices(vec![Attachment::Disk(Box::new(EmptyDisk)), Attachment::Ethernet], 240_000_000);
+        assert!(matches!(usb.peer, Some(Peer::Hub(_))));
+        assert!(usb.has_ethernet() && usb.ethernet_mut().is_some());
+        assert_eq!(usb.peer_up(), Some(false));
+        let setup_status = |peer: &mut Peer, setup: [u8; 8]| {
+            assert_eq!(peer.setup(&setup), Reply::Ack, "{setup:?}");
+            assert_eq!(peer.control_in(true), Reply::Data(vec![]), "{setup:?}");
+        };
+        let peer = usb.peer.as_mut().unwrap();
+        // the hub at 0: addressed 1, configured, its two ports powered and port 1 reset
+        assert!(peer.route(0).is_some() && peer.route(1).is_none());
+        let hub = peer.route(0).unwrap();
+        assert!(matches!(hub, Peer::Hub(_)));
+        setup_status(hub, [0, 5, 1, 0, 0, 0, 0, 0]);
+        let hub = peer.route(1).expect("the hub at 1");
+        setup_status(hub, [0, 9, 1, 0, 0, 0, 0, 0]);
+        setup_status(hub, [0x23, 3, 8, 0, 1, 0, 0, 0]);
+        setup_status(hub, [0x23, 3, 8, 0, 2, 0, 0, 0]);
+        assert!(peer.route(0).is_none(), "nothing at the default address before a reset");
+        let hub = peer.route(1).unwrap();
+        setup_status(hub, [0x23, 3, 4, 0, 1, 0, 0, 0]);
+        // port 1's device, the disk, at 0: addressed 2
+        let disk = peer.route(0).expect("the disk at the default address");
+        assert!(matches!(disk, Peer::Disk(_)));
+        setup_status(disk, [0, 5, 2, 0, 0, 0, 0, 0]);
+        assert!(peer.route(0).is_none() && matches!(peer.route(2), Some(Peer::Disk(_))));
+        // port 2's, the adapter, at 0: addressed 3, configured, its link up
+        let hub = peer.route(1).unwrap();
+        setup_status(hub, [0x23, 3, 4, 0, 2, 0, 0, 0]);
+        let eth = peer.route(0).expect("the adapter at the default address");
+        assert!(matches!(eth, Peer::Ethernet(_)));
+        setup_status(eth, [0, 5, 3, 0, 0, 0, 0, 0]);
+        let eth = peer.route(3).unwrap();
+        setup_status(eth, [0, 9, 1, 0, 0, 0, 0, 0]);
+        setup_status(eth, [1, 11, 1, 0, 1, 0, 0, 0]);
+        setup_status(eth, [0x21, 0x43, 0x0d, 0, 0, 0, 0, 0]);
+        assert_eq!(usb.peer_up(), Some(true));
+        // a frame for the station reaches the adapter behind the hub
+        let mut to_us = ethernet::MAC.to_vec();
+        to_us.extend([0; 54]);
+        usb.ethernet_mut().unwrap().push_rx(to_us.clone());
+        let Some(Peer::Hub(h)) = usb.peer.as_mut() else { panic!() };
+        let Some(Peer::Ethernet(e)) = h.children.iter_mut().find(|c| matches!(c, Peer::Ethernet(_))) else { panic!() };
+        assert_eq!(e.bulk_in(1), Reply::Data(to_us));
+        // the chip reset: the same two devices behind a hub again, unaddressed
+        let mut reset = Usb::default();
+        reset.keep_attachment(&mut usb, 240_000_000);
+        let Some(Peer::Hub(h)) = reset.peer.as_ref() else { panic!("the hub went") };
+        assert_eq!(h.children.len(), 2);
+        assert!(h.children.iter().all(|c| c.address() == 0));
+        assert!(reset.has_ethernet());
     }
 
     fn host_disk() -> (Usb, Ram) {
@@ -1499,9 +1752,12 @@ mod tests {
             assert_eq!(u.packet_deadline(), u64::MAX);
             assert_eq!(u.ep[0].host_tx & 1, 0);
             if reset == 1 { assert!(u.host_session()); }
-            // A full controller reinitialization starts a fresh descriptor transfer.
+            // A full controller reinitialization starts a fresh descriptor transfer (after a
+            // chip reset the firmware programs the EP0 buffer and count again, as at the start).
             u.write(USB_LO, 0, deadline);
             u.write(USB_LO, 5, deadline);
+            u.write(USB_LO + 0x18, EP0_BUF, deadline);
+            u.write(USB_LO + 8, 8, deadline);
             u.sie_write(S_DEVCTL, 3);
             u.sie_write(S_CSR0, 0x0a);
             u.complete_packets(&mut ram, u.packet_deadline());
@@ -1518,7 +1774,7 @@ mod tests {
     #[test]
     fn host_bulk_target_errors_and_flush_are_direction_specific() {
         let (mut u, mut ram) = host_disk();
-        let d = u.disk.as_mut().unwrap();
+        let Some(Peer::Disk(d)) = u.peer.as_mut() else { panic!("no disk") };
         assert_eq!(d.setup(&[0, 5, 1, 0, 0, 0, 0, 0]), Reply::Ack);
         d.control_in(true);
         d.setup(&[0, 9, 1, 0, 0, 0, 0, 0]);

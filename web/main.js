@@ -946,9 +946,17 @@ function boot(options = {}) {
         sectors: packSectors(sectors).buffer, syx: importedBank ? importedBank.slice().buffer : null,
         script: trying?.script ? new TextEncoder().encode(trying.script).buffer : null,
         mhz: clock, jit: params.get("jit") !== "0", chip: CHIP,
-        // ?oss-wifi=1: the WiFi chip for a clean-room driver (core-fm1); &internet=1: this
-        // page's fetch() behind its virtual AP (off by default: a firmware reaches nothing)
-        ossWifi: params.get("oss-wifi") === "1", internet: params.get("internet") === "1",
+        // ?wifi=oss (or ?oss-wifi=1): the WiFi chip for a clean-room driver (modd); ?usb=ethernet:
+        // a USB network adapter on the host port; &internet=1: this page's fetch() behind the
+        // virtual subnet either reaches (off by default: a firmware reaches nothing)
+        ossWifi: params.get("oss-wifi") === "1" || params.get("wifi") === "oss",
+        // ?wifi=jieli (or ?wifi=1): the vendor stack's mailbox, for fm1-base firmware built for it
+        vendorWifi: params.get("wifi") === "jieli" || params.get("wifi") === "1",
+        // &wifi-ssid=NAME&wifi-password=PASS: the virtual access point (Home / fm1pass)
+        wifiSsid: params.get("wifi-ssid") || undefined, wifiPassword: params.get("wifi-password") || undefined,
+        usbEthernet: (params.get("usb") || "").split(",").includes("ethernet"),
+        // &net=internet (or &internet=1): the page's fetch() behind the subnet; lan is the same here
+        internet: params.get("internet") === "1" || ["internet", "lan"].includes(params.get("net")),
         // (?ahead=0: each quantum emulates only for its own frames, as before the even pace)
         ahead: params.has("ahead") ? Number(params.get("ahead")) : undefined });
       status.textContent = `booting ${f.name}…`;

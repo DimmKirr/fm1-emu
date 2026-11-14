@@ -447,6 +447,40 @@ fn oss_wifi_tick_delivers_beacons_into_the_rx_ring() {
     assert!(beacons >= 4, "{beacons} beacons in 350 ms");
 }
 
+/// --wifi-ssid / --wifi-password: the chip's beacons carry the configured name (the WPA2
+/// handshake keys off the configured passphrase: `WifiHw::ap`).
+#[test]
+fn oss_wifi_beacons_carry_the_configured_ssid() {
+    let mut soc = fm1_soc::Soc::new(1 << 16, vec![0; 0x1000]);
+    soc.set_wifi_ap(fm1_soc::net::Ap { ssid: "Studio".into(), password: "letmein12".into() });
+    soc.enable_oss_wifi();
+    assert_eq!(soc.wifi_hw.as_ref().unwrap().ap.password, "letmein12");
+    const RAM_BASE: u32 = 0x01c0_0000;
+    const RXD_ADDR: u32 = RAM_BASE + 0x200;
+    const RX_BUF: u32 = RAM_BASE + 0x2000;
+    soc.write32(0x40290, RXD_ADDR);
+    soc.write32(0x40294, 1);
+    soc.write32(RXD_ADDR, RX_BUF);
+    soc.write32(RXD_ADDR + 4, 1600);
+    soc.write32(RXD_ADDR + 8, 0);
+    soc.write32(RXD_ADDR + 12, 0);
+    soc.write32(0x40208, 1 << 2);
+    let step = soc.periph.cycle_of_ms(1).max(1);
+    let mut names = Vec::new();
+    for _ in 0..250 {
+        soc.advance(step);
+        if soc.read32(RXD_ADDR + 12) & (1 << 17) != 0 {
+            // a beacon: 24 header, 8 timestamp, 2 interval, 2 capability, then the SSID element
+            let len = soc.read8(RX_BUF + 37) as u32;
+            let name: Vec<u8> = (0..len).map(|i| soc.read8(RX_BUF + 38 + i)).collect();
+            names.push(String::from_utf8_lossy(&name).into_owned());
+            soc.write32(RXD_ADDR + 12, 0);
+        }
+    }
+    assert!(names.contains(&"Studio".to_string()) && names.contains(&"Cafe".to_string()), "{names:?}");
+    assert!(!names.contains(&"Home".to_string()), "{names:?}");
+}
+
 /// The NAT over the host's own sockets, offline: a listener on 127.0.0.1. The SYN-ACK
 /// comes from a later poll (the connect runs on a thread of its own), then data both
 /// ways, and the host's close reaches the guest as a FIN.

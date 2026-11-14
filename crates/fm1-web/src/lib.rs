@@ -265,11 +265,50 @@ pub extern "C" fn fm1_oss_wifi(internet: u32) {
     }
 }
 
-/// The wall clock (unix seconds) the virtual subnet's SNTP answers from; after fm1_oss_wifi.
+/// The virtual access point's name and passphrase (?wifi-ssid=, ?wifi-password=), UTF-8 from
+/// fm1_alloc, before or after fm1_oss_wifi / fm1_vendor_wifi. 1 when they would not do for WPA2.
+#[no_mangle]
+pub extern "C" fn fm1_wifi_ap(ssid: *mut u8, ssid_len: u32, pass: *mut u8, pass_len: u32) -> u32 {
+    // SAFETY: as fm1_bench_script: fm1_alloc allocations JS filled, consumed exactly once.
+    let ssid = unsafe { Vec::from_raw_parts(ssid, ssid_len as usize, ssid_len as usize) };
+    let pass = unsafe { Vec::from_raw_parts(pass, pass_len as usize, pass_len as usize) };
+    let (Ok(ssid), Ok(pass)) = (String::from_utf8(ssid), String::from_utf8(pass)) else { return 1 };
+    if fm1_soc::net::Ap::check(&ssid, &pass).is_err() { return 1; }
+    let Some(m) = machine() else { return 1 };
+    m.soc.set_wifi_ap(fm1_soc::net::Ap { ssid, password: pass });
+    0
+}
+
+/// The vendor WiFi stack's view (fm1_soc::wifi_mailbox): for an fm1-base firmware built with
+/// wifi_stack = "emu"; after a boot, before the first render. `internet` as for fm1_oss_wifi.
+#[no_mangle]
+pub extern "C" fn fm1_vendor_wifi(internet: u32) {
+    if let Some(m) = machine() {
+        m.soc.enable_vendor_wifi();
+        if internet != 0 {
+            m.soc.enable_internet(false);
+        }
+    }
+}
+
+/// A USB Ethernet adapter (CDC-ECM) on the FM-1's host port (fm1_soc::usb::ethernet), the
+/// virtual subnet behind it: after a boot, before the first render. `internet` as for fm1_oss_wifi.
+#[no_mangle]
+pub extern "C" fn fm1_usb_ethernet(internet: u32) {
+    if let Some(m) = machine() {
+        m.soc.usb_ethernet();
+        if internet != 0 {
+            m.soc.enable_internet(false);
+        }
+    }
+}
+
+/// The wall clock (unix seconds) the virtual subnet's SNTP answers from; after fm1_oss_wifi
+/// or fm1_usb_ethernet.
 #[no_mangle]
 pub extern "C" fn fm1_set_epoch(unix_secs: u32) {
-    if let Some(hw) = machine().and_then(|m| m.soc.wifi_hw.as_mut()) {
-        hw.vnet.epoch_hint = Some(unix_secs as u64);
+    if let Some(net) = machine().and_then(|m| m.soc.net.as_mut()) {
+        net.epoch_hint = Some(unix_secs as u64);
     }
 }
 
