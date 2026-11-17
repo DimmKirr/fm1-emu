@@ -300,7 +300,7 @@ fn knob(buf: &mut [u32], cx: f32, cy: f32, r: f32, angle: f32, glow: f32) {
         disc(buf, cx, cy, r + 4.0, |_, _| mix(BODY_TOP, AMBER, glow * 0.7));
     }
     disc(buf, cx, cy, r, |dx, dy| {
-        let a = dy.atan2(dx);
+        let a = libm::atan2f(dy, dx);
         let flute = ((a * 22.0).sin() * 0.5 + 0.5).powf(0.6);
         mix(0x2a2c30, 0x5e6168, flute * 0.55 + (-dy / r) * 0.25 + 0.15)
     });
@@ -321,7 +321,7 @@ fn wheel(buf: &mut [u32], x: f32, y: f32, w: f32, h: f32, t: f32) {
     let phase = t * 5.0;
     for py in y as i32..(y + h) as i32 {
         let v = ((py as f32 + 0.5 - cy) / rr).clamp(-0.999, 0.999);
-        let th = v.asin();
+        let th = libm::asinf(v);
         let shade = (th.cos() * 0.85 - v * 0.25).clamp(0.0, 1.0);
         let rib = ((th * 18.0 + phase).sin() * 0.5 + 0.5).powf(6.0);
         for px in x as i32..(x + w) as i32 {

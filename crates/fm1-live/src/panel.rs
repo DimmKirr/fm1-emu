@@ -338,7 +338,7 @@ pub fn knob(buf: &mut [u32], cx: f32, cy: f32, r: f32, angle: f32, glow: f32) {
         disc(buf, cx, cy, r + 4.0, |_, _| mix(0x2a2b2e, AMBER, glow * 0.8));
     }
     disc(buf, cx, cy, r, |dx, dy| {
-        let a = dy.atan2(dx);
+        let a = libm::atan2f(dy, dx);
         let ridge = ((a * 18.0).sin() * 0.5 + 0.5) * 0.25;
         mix(0x2e3034, 0x50535a, ridge + (-dy / r) * 0.2 + 0.2)
     });
