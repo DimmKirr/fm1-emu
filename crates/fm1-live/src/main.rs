@@ -189,6 +189,8 @@ struct Opts {
     /// --wifi-ssid NAME, --wifi-password PASS: the virtual access point either flavour offers
     wifi_ssid: String,
     wifi_password: String,
+    /// --forward HOST:GUEST: forward host TCP port to guest TCP port (e.g. 9222:9222)
+    forwards: Vec<(u16, u16)>,
 }
 
 /// Unbuffered sector I/O: a completed write is already in the backing file.
@@ -300,7 +302,7 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
                        latency_ms: AUDIO_TARGET_DEFAULT_MS, buffer: None, exclusive: false,
                        oss_wifi: false, internet: false, allow_lan: false, theme: "default".into(), cdp: None,
                        usb_disk: false, disk: None, usb_ethernet: false, wifi_jieli: false,
-                       wifi_ssid: "Home".into(), wifi_password: "fm1pass".into() };
+                       wifi_ssid: "Home".into(), wifi_password: "fm1pass".into(), forwards: Vec::new() };
     let mut i = 1;
     while i < a.len() {
         if a[i] == "--usb" || a[i].starts_with("--usb=") {
@@ -434,6 +436,11 @@ fn parse_args(a: Vec<String>) -> Option<Opts> {
             "--record" => o.record = Some(a.get(i + 1)?.clone()),
             "--theme" => o.theme = a.get(i + 1)?.clone(),
             "--cdp" => o.cdp = Some(a.get(i + 1)?.parse().ok()?),
+            "--forward" => {
+                let spec = a.get(i + 1)?;
+                let (h, g) = spec.split_once(':')?;
+                o.forwards.push((h.parse().ok()?, g.parse().ok()?));
+            }
             "--latency" => o.latency_ms = a.get(i + 1)?.parse::<f64>().ok().filter(|v| (1.0..=500.0).contains(v))?,
             "--buffer" => o.buffer = Some(a.get(i + 1)?.parse().ok().filter(|v| (16..=8192).contains(v))?),
             _ => return None,
@@ -545,6 +552,12 @@ impl Machine {
         }
         if o.internet {
             soc.enable_internet(o.allow_lan);
+        }
+        for &(host_port, guest_port) in &o.forwards {
+            if let Err(e) = soc.add_port_forward(host_port, guest_port) {
+                return Err(std::io::Error::other(format!("--forward {}:{}: {}", host_port, guest_port, e)));
+            }
+            eprintln!("forward: host:{} -> guest:{}", host_port, guest_port);
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -1561,6 +1574,7 @@ options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--fl
          (--oss-wifi, --internet, --allow-lan, --usb-mode device|host|ethernet, --disk FILE: the older
                       spellings of --wifi oss, --net internet, --net lan, --usb ..., --disk-image; still taken)
 remote:   --cdp PORT   serve a thin HTML page + WebSocket on PORT for remote LCD + control (JSON-RPC)
+          --forward H:G forward host TCP port H to guest TCP port G (e.g. --forward 9222:9222)
 headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
           --shot MS    run MS ms, then write the panel to work/panel.ppm
           --record DIR with --shot: a PPM frame every 16 ms (62.5 fps) as DIR/000000.ppm…, and the audio
@@ -1626,8 +1640,8 @@ fn open_another() -> Option<Vec<String>> {
 /// new one never loads or overwrites the old one's flash.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn carried_over(args: &[String]) -> Vec<String> {
-    const WITH_VALUE: [&str; 11] = ["--mhz", "--midi", "--midi-ch", "--latency", "--buffer", "--map", "--flash-chip", "--wifi",
-                                    "--wifi-ssid", "--wifi-password", "--net"];
+    const WITH_VALUE: [&str; 12] = ["--mhz", "--midi", "--midi-ch", "--latency", "--buffer", "--map", "--flash-chip", "--wifi",
+                                    "--wifi-ssid", "--wifi-password", "--net", "--forward"];
     const FLAGS: [&str; 6] = ["--usb", "--exclusive", "--midi-log", "--oss-wifi", "--internet", "--allow-lan"];
     let mut out = Vec::new();
     let mut i = 0;

@@ -207,6 +207,15 @@ impl VirtualNet {
         self.nat = Some(crate::nat::Nat::with_backend(net));
     }
 
+    /// Forward `host_port` on the host to `guest_port` on the guest station.
+    /// Requires the NAT to be enabled first.
+    pub fn add_port_forward(&mut self, host_port: u16, guest_port: u16) -> std::io::Result<()> {
+        match self.nat.as_mut() {
+            Some(nat) => nat.add_port_forward(host_port, guest_port),
+            None => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "NAT not enabled")),
+        }
+    }
+
     /// Where a packet to `dst` goes on the host side: the name behind one of our DNS
     /// answers, or the address itself. None inside our own subnet: nothing is there.
     fn host_addr(&self, dst: [u8; 4]) -> Option<HostAddr> {
@@ -534,12 +543,16 @@ impl VirtualNet {
     }
 
     fn tcp(&mut self, ip: &[u8], payload: &[u8]) -> Vec<Vec<u8>> {
-        let to = self.host_addr(ip[16..20].try_into().unwrap());
+        let dst: [u8; 4] = ip[16..20].try_into().unwrap();
+        let to = self.host_addr(dst);
         if trace_on() && payload.len() >= 20 && payload[13] & 0x02 != 0 {
             eprintln!("net: tcp syn to {:?}:{} (nat: {})", to, be16(&payload[2..4]), self.nat.is_some());
         }
         match (to, self.nat.as_mut()) {
             (Some(to), Some(nat)) => nat.tcp_in(ip, payload, &to),
+            (None, Some(nat)) if dst == GW_IP && nat.has_inbound_conn(ip, payload) => {
+                nat.tcp_in(ip, payload, &HostAddr::Ip(GW_IP))
+            }
             _ => self.tcp_reject(ip, payload),
         }
     }

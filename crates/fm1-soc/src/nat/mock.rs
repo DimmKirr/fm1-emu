@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use super::{ConnectState, HostAddr, HostNet, TcpSock, UdpSock};
+use super::{ConnectState, HostAddr, HostNet, TcpListenerSock, TcpSock, UdpSock};
 
 /// One scripted TCP connection.
 pub struct MockSock {
@@ -39,6 +39,11 @@ pub struct MockUdp {
     pub inbox: VecDeque<Vec<u8>>,
 }
 
+/// A scripted inbound listener: tests push MockSock instances to simulate accepted connections.
+pub struct MockListener {
+    pub pending: VecDeque<Arc<Mutex<MockSock>>>,
+}
+
 /// Everything the mock host saw, shared with the test.
 #[derive(Default)]
 pub struct MockState {
@@ -46,6 +51,8 @@ pub struct MockState {
     pub tcp: Vec<Arc<Mutex<MockSock>>>,
     /// Every UDP flow the NAT opened, in order.
     pub udp: Vec<Arc<Mutex<MockUdp>>>,
+    /// Listeners bound by `tcp_listen`, keyed by port.
+    pub listeners: Vec<(u16, Arc<Mutex<MockListener>>)>,
     /// `tcp_connect` fails: an unreachable host.
     pub refuse_tcp: bool,
     /// The state new TCP connections start in (Ready unless set).
@@ -89,6 +96,24 @@ impl HostNet for MockNet {
         let flow = Arc::new(Mutex::new(MockUdp { to: (to.clone(), port), sent: Vec::new(), inbox: VecDeque::new() }));
         self.0.lock().unwrap().udp.push(flow.clone());
         Ok(Box::new(MockUdpSock(flow)))
+    }
+
+    fn tcp_listen(&mut self, port: u16) -> io::Result<Box<dyn TcpListenerSock>> {
+        let listener = Arc::new(Mutex::new(MockListener { pending: VecDeque::new() }));
+        self.0.lock().unwrap().listeners.push((port, listener.clone()));
+        Ok(Box::new(MockListenerSock(listener)))
+    }
+}
+
+struct MockListenerSock(Arc<Mutex<MockListener>>);
+
+impl TcpListenerSock for MockListenerSock {
+    fn accept(&mut self) -> io::Result<Box<dyn TcpSock>> {
+        let mut l = self.0.lock().unwrap();
+        match l.pending.pop_front() {
+            Some(sock) => Ok(Box::new(MockTcp(sock))),
+            None => Err(io::ErrorKind::WouldBlock.into()),
+        }
     }
 }
 

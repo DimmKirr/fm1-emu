@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSock
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
-use super::{lan_allowed, ConnectState, HostAddr, HostNet, TcpSock, UdpSock, CONNECT_TIMEOUT_MS};
+use super::{lan_allowed, ConnectState, HostAddr, HostNet, TcpListenerSock, TcpSock, UdpSock, CONNECT_TIMEOUT_MS};
 
 /// Datagrams kept for a UDP flow whose name is still being resolved.
 const UDP_QUEUE_CAP: usize = 16;
@@ -71,6 +71,12 @@ impl HostNet for NativeNet {
             Ok(s)
         })?;
         Ok(Box::new(NativeTcp { pending: Some(rx), stream: None, failed: None }))
+    }
+
+    fn tcp_listen(&mut self, port: u16) -> io::Result<Box<dyn TcpListenerSock>> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        listener.set_nonblocking(true)?;
+        Ok(Box::new(NativeListener(listener)))
     }
 
     fn udp_open(&mut self, to: &HostAddr, port: u16) -> io::Result<Box<dyn UdpSock>> {
@@ -194,5 +200,16 @@ impl UdpSock for NativeUdp {
             Some(s) => s.recv(buf),
             None => Err(io::ErrorKind::WouldBlock.into()),
         }
+    }
+}
+
+struct NativeListener(std::net::TcpListener);
+
+impl TcpListenerSock for NativeListener {
+    fn accept(&mut self) -> io::Result<Box<dyn TcpSock>> {
+        let (stream, _addr) = self.0.accept()?;
+        stream.set_nonblocking(true)?;
+        let _ = stream.set_nodelay(true);
+        Ok(Box::new(NativeTcp { pending: None, stream: Some(stream), failed: None }))
     }
 }

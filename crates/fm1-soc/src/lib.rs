@@ -793,6 +793,15 @@ impl Soc {
         }
     }
 
+    /// Forward a host TCP port to a guest TCP port through the NAT.
+    /// Call after `enable_internet`.
+    pub fn add_port_forward(&mut self, host_port: u16, guest_port: u16) -> std::io::Result<()> {
+        match self.net.as_mut() {
+            Some(net) => net.add_port_forward(host_port, guest_port),
+            None => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "no network")),
+        }
+    }
+
     /// Ethernet frames between the links and the virtual subnet: what the station sent gets
     /// its answers at once; on the network's tick (`tick`) the NAT's sockets are polled too.
     /// Then the WiFi chip's RX ring takes what waits for the station.

@@ -66,6 +66,13 @@ pub trait TcpSock: Send {
     fn shutdown_write(&mut self) {}
 }
 
+/// A host TCP listener, non-blocking: accepts connections from the host side.
+pub trait TcpListenerSock: Send {
+    /// Accept a pending connection: `Ok(sock)` for a new connection, `WouldBlock` when
+    /// none is waiting.
+    fn accept(&mut self) -> io::Result<Box<dyn TcpSock>>;
+}
+
 /// A host UDP "connection": datagrams to one peer and back.
 pub trait UdpSock: Send {
     fn send(&mut self, buf: &[u8]) -> io::Result<usize>;
@@ -76,6 +83,10 @@ pub trait UdpSock: Send {
 pub trait HostNet: Send {
     fn tcp_connect(&mut self, to: &HostAddr, port: u16) -> io::Result<Box<dyn TcpSock>>;
     fn udp_open(&mut self, to: &HostAddr, port: u16) -> io::Result<Box<dyn UdpSock>>;
+    /// Bind a TCP listener on the host side. Not all backends support this (WASM cannot).
+    fn tcp_listen(&mut self, _port: u16) -> io::Result<Box<dyn TcpListenerSock>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// No host network at all: every connection is refused.
@@ -136,8 +147,10 @@ fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp: &[u8]) -> u16 {
 
 const GW_MAC: [u8; 6] = [0x02, 0x53, 0x49, 0x4d, 0x00, 0x02];
 const STA_MAC: [u8; 6] = [0x02, 0x53, 0x49, 0x4d, 0x00, 0x15];
+const GW_IP: [u8; 4] = [10, 0, 2, 2];
+const STA_IP: [u8; 4] = [10, 0, 2, 15];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum TcpState {
     /// The host connection is on its way; the guest's SYN waits for its SYN-ACK.
     Connecting,
@@ -151,6 +164,8 @@ enum TcpState {
     /// Both sides are done; the entry stays a while against late segments.
     TimeWait(u64),
     Closed,
+    /// Inbound: the NAT injected a SYN to the guest and waits for the guest's SYN-ACK.
+    InboundSynSent,
 }
 
 struct TcpConn {
@@ -181,10 +196,17 @@ struct UdpFlow {
     last_active: u64,
 }
 
+struct PortForward {
+    host_port: u16,
+    guest_port: u16,
+    listener: Box<dyn TcpListenerSock>,
+}
+
 pub struct Nat {
     net: Box<dyn HostNet>,
     tcp: Vec<TcpConn>,
     udp: Vec<UdpFlow>,
+    forwards: Vec<PortForward>,
     now_ms: u64,
     pub stats: NatStats,
 }
@@ -231,7 +253,7 @@ impl Nat {
 
     /// A NAT over `net`.
     pub fn with_backend(net: Box<dyn HostNet>) -> Self {
-        Self { net, tcp: Vec::new(), udp: Vec::new(), now_ms: 0, stats: NatStats::default() }
+        Self { net, tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), now_ms: 0, stats: NatStats::default() }
     }
 
     pub fn set_time(&mut self, ms: u64) {
@@ -241,6 +263,32 @@ impl Nat {
     /// How many TCP connections the NAT tracks (any state).
     pub fn tcp_count(&self) -> usize {
         self.tcp.len()
+    }
+
+    /// Forward host_port on the host to guest_port on the guest station (10.0.2.15).
+    /// The host binds a TCP listener; accepted connections become inbound NAT entries
+    /// whose SYN is injected to the guest.
+    pub fn add_port_forward(&mut self, host_port: u16, guest_port: u16) -> io::Result<()> {
+        let listener = self.net.tcp_listen(host_port)?;
+        self.forwards.push(PortForward { host_port, guest_port, listener });
+        Ok(())
+    }
+
+    /// Is there an inbound (port-forwarded) TCP connection matching this segment?
+    pub fn has_inbound_conn(&self, ip: &[u8], tcp: &[u8]) -> bool {
+        if tcp.len() < 20 || ip.len() < 20 {
+            return false;
+        }
+        let src_port = be16(&tcp[0..2]);
+        let dst_port = be16(&tcp[2..4]);
+        let guest_ip: [u8; 4] = ip[12..16].try_into().unwrap();
+        let host_ip: [u8; 4] = ip[16..20].try_into().unwrap();
+        self.tcp.iter().any(|c| {
+            c.guest_ip == guest_ip && c.guest_port == src_port
+                && c.host_ip == host_ip && c.host_port == dst_port
+                && matches!(c.state, TcpState::InboundSynSent | TcpState::SynAckSent
+                    | TcpState::Connected | TcpState::CloseWait | TcpState::FinWait)
+        })
     }
 
     /// Handle a TCP segment from the guest (`ip`: its IPv4 header; `to`: where the host
@@ -282,6 +330,20 @@ impl Nat {
         let Some(i) = idx else { return vec![] };
 
         if syn {
+            if self.tcp[i].state == TcpState::InboundSynSent {
+                // the guest's SYN-ACK in response to our inbound SYN
+                let ack_flag = flags & 0x10 != 0;
+                if ack_flag {
+                    self.tcp[i].guest_seq = seq.wrapping_add(1);
+                    self.tcp[i].state = TcpState::Connected;
+                    self.tcp[i].last_active = self.now_ms;
+                    if crate::net::trace_on() {
+                        eprintln!("nat: inbound {}:{} connected", self.tcp[i].guest_port, self.tcp[i].host_port);
+                    }
+                    return self.tcp_ack(i);
+                }
+                return vec![];
+            }
             // a retransmitted SYN: the host connect is still pending (nothing to say yet),
             // or our SYN-ACK was lost (say it again)
             return match self.tcp[i].state {
@@ -569,10 +631,65 @@ impl Nat {
         vec![]
     }
 
+    /// Build a SYN frame from host_ip:host_port to guest_ip:guest_port with the given ISN.
+    fn tcp_syn_frame(&self, idx: usize) -> Vec<Vec<u8>> {
+        let c = &self.tcp[idx];
+        let seq = c.our_seq.wrapping_sub(1);
+        let mut tcp = vec![0u8; 24]; // 20 header + 4 MSS option
+        put_be16(&mut tcp[0..], c.host_port);
+        put_be16(&mut tcp[2..], c.guest_port);
+        put_be32(&mut tcp[4..], seq);
+        put_be32(&mut tcp[8..], 0);
+        tcp[12] = 0x60; // data offset: 6 words (24 bytes)
+        tcp[13] = 0x02; // SYN
+        put_be16(&mut tcp[14..], TCP_WINDOW);
+        // MSS option
+        tcp[20] = 2;
+        tcp[21] = 4;
+        tcp[22] = (TCP_MSS >> 8) as u8;
+        tcp[23] = TCP_MSS as u8;
+        vec![self.ip_tcp_frame(c.host_ip, c.guest_ip, &tcp)]
+    }
+
     /// Poll all connections for incoming data. Returns Ethernet frames to deliver to guest.
     pub fn poll(&mut self) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         let mut buf = [0u8; 4096];
+
+        // accept inbound connections from port-forward listeners
+        for fi in 0..self.forwards.len() {
+            if self.tcp.len() >= MAX_TCP {
+                break;
+            }
+            match self.forwards[fi].listener.accept() {
+                Ok(sock) => {
+                    let our_seq: u32 = (self.now_ms as u32).wrapping_mul(0x9e37_79b9).wrapping_add(self.forwards[fi].guest_port as u32);
+                    let guest_port = self.forwards[fi].guest_port;
+                    let host_port = self.forwards[fi].host_port;
+                    if crate::net::trace_on() {
+                        eprintln!("nat: inbound accept on host:{} -> guest:{}", host_port, guest_port);
+                    }
+                    self.tcp.push(TcpConn {
+                        guest_ip: STA_IP,
+                        guest_port,
+                        host_ip: GW_IP,
+                        host_port,
+                        sock,
+                        state: TcpState::InboundSynSent,
+                        guest_seq: 0,
+                        our_seq: our_seq.wrapping_add(1),
+                        tx: VecDeque::new(),
+                        fin_pending: false,
+                        last_active: self.now_ms,
+                        connect_start: self.now_ms,
+                    });
+                    self.stats.tcp_connects += 1;
+                    frames.extend(self.tcp_syn_frame(self.tcp.len() - 1));
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {}
+            }
+        }
 
         // poll TCP connections
         for i in 0..self.tcp.len() {
@@ -1124,5 +1241,119 @@ mod tests {
         assert_eq!(flags_of(&out[0]), RST | ACK);
         assert!(send_udp(&mut nat, &guest_udp(50000, 123, b"ping")).is_empty());
         assert!(nat.poll().is_empty());
+    }
+
+    /// A TCP frame from STA_IP:src_port to GW_IP:dst_port (for inbound connection replies).
+    fn inbound_tcp(src_port: u16, dst_port: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Vec<u8> {
+        let mut tcp = vec![0u8; 20 + data.len()];
+        put_be16(&mut tcp[0..], src_port);
+        put_be16(&mut tcp[2..], dst_port);
+        put_be32(&mut tcp[4..], seq);
+        put_be32(&mut tcp[8..], ack);
+        tcp[12] = 0x50;
+        tcp[13] = flags;
+        put_be16(&mut tcp[14..], 8192);
+        tcp[20..].copy_from_slice(data);
+        let ck = tcp_checksum(STA_IP, GW_IP, &tcp);
+        put_be16(&mut tcp[16..], ck);
+        let ip_len = 20 + tcp.len();
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        put_be16(&mut ip[2..], ip_len as u16);
+        ip[8] = 64;
+        ip[9] = 6;
+        ip[12..16].copy_from_slice(&STA_IP);
+        ip[16..20].copy_from_slice(&GW_IP);
+        let ck = checksum(&ip);
+        put_be16(&mut ip[10..], ck);
+        let mut f = Vec::with_capacity(14 + ip_len);
+        f.extend_from_slice(&GW_MAC);
+        f.extend_from_slice(&STA_MAC);
+        f.extend_from_slice(&[0x08, 0x00]);
+        f.extend_from_slice(&ip);
+        f.extend_from_slice(&tcp);
+        f
+    }
+
+    fn send_inbound_tcp(nat: &mut Nat, frame: &[u8]) -> Vec<Vec<u8>> {
+        nat.tcp_in(&frame[14..34], &frame[34..], &HostAddr::Ip(GW_IP))
+    }
+
+    #[test]
+    fn inbound_port_forward_completes_handshake() {
+        let (net, state) = MockNet::new();
+        let mut nat = Nat::with_backend(Box::new(net));
+        nat.add_port_forward(8080, 9222).unwrap();
+
+        // simulate an accepted connection on the listener
+        let inbound_sock = std::sync::Arc::new(std::sync::Mutex::new(mock::MockSock {
+            to: (HostAddr::Ip(GW_IP), 8080),
+            state: ConnectState::Ready,
+            rx: VecDeque::new(),
+            eof: false,
+            tx: Vec::new(),
+            accept_limit: None,
+            shutdown: false,
+            read_error: None,
+            write_error: None,
+        }));
+        state.lock().unwrap().listeners[0].1.lock().unwrap().pending.push_back(inbound_sock.clone());
+
+        // poll: the NAT accepts the connection and injects a SYN to the guest
+        let out = nat.poll();
+        assert_eq!(out.len(), 1, "one SYN to the guest");
+        assert_eq!(flags_of(&out[0]), SYN, "a SYN, not SYN-ACK");
+        let isn = seq_of(&out[0]);
+        // the SYN is from GW_IP:8080 to STA_IP:9222
+        let tcp = tcp_of(&out[0]);
+        assert_eq!(be16(&tcp[0..2]), 8080, "src port is the host forward port");
+        assert_eq!(be16(&tcp[2..4]), 9222, "dst port is the guest port");
+        assert_eq!(&out[0][26..30], &GW_IP, "src IP is gateway");
+        assert_eq!(&out[0][30..34], &STA_IP, "dst IP is station");
+
+        // the guest responds with SYN-ACK
+        let guest_isn = 5000u32;
+        let out = send_inbound_tcp(&mut nat, &inbound_tcp(9222, 8080, guest_isn, isn.wrapping_add(1), SYN | ACK, &[]));
+        assert_eq!(out.len(), 1, "our ACK");
+        assert_eq!(flags_of(&out[0]), ACK);
+        assert_eq!(ack_of(&out[0]), guest_isn.wrapping_add(1));
+        assert_eq!(nat.tcp[0].state, TcpState::Connected);
+    }
+
+    #[test]
+    fn inbound_data_relays_both_ways() {
+        let (net, state) = MockNet::new();
+        let mut nat = Nat::with_backend(Box::new(net));
+        nat.add_port_forward(8080, 9222).unwrap();
+
+        let inbound_sock = std::sync::Arc::new(std::sync::Mutex::new(mock::MockSock {
+            to: (HostAddr::Ip(GW_IP), 8080),
+            state: ConnectState::Ready,
+            rx: VecDeque::new(),
+            eof: false,
+            tx: Vec::new(),
+            accept_limit: None,
+            shutdown: false,
+            read_error: None,
+            write_error: None,
+        }));
+        state.lock().unwrap().listeners[0].1.lock().unwrap().pending.push_back(inbound_sock.clone());
+
+        // complete the handshake
+        let syn_frames = nat.poll();
+        let isn = seq_of(&syn_frames[0]);
+        let guest_isn = 5000u32;
+        send_inbound_tcp(&mut nat, &inbound_tcp(9222, 8080, guest_isn, isn.wrapping_add(1), SYN | ACK, &[]));
+
+        // host -> guest: push data into the mock socket
+        inbound_sock.lock().unwrap().rx.extend(b"HTTP/1.1 200 OK\r\n");
+        let out = nat.poll();
+        assert!(!out.is_empty(), "data from host to guest");
+        assert_eq!(payload_of(&out[0]), b"HTTP/1.1 200 OK\r\n");
+
+        // guest -> host: the guest sends data back
+        let out = send_inbound_tcp(&mut nat, &inbound_tcp(9222, 8080, guest_isn.wrapping_add(1), isn.wrapping_add(18), PSH | ACK, b"GET / HTTP/1.1\r\n"));
+        assert_eq!(flags_of(&out[0]), ACK);
+        assert_eq!(inbound_sock.lock().unwrap().tx, b"GET / HTTP/1.1\r\n");
     }
 }
