@@ -208,6 +208,7 @@ pub struct Nat {
     udp: Vec<UdpFlow>,
     forwards: Vec<PortForward>,
     now_ms: u64,
+    next_inbound_port: u16,
     pub stats: NatStats,
 }
 
@@ -253,7 +254,7 @@ impl Nat {
 
     /// A NAT over `net`.
     pub fn with_backend(net: Box<dyn HostNet>) -> Self {
-        Self { net, tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), now_ms: 0, stats: NatStats::default() }
+        Self { net, tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), now_ms: 0, next_inbound_port: 50000, stats: NatStats::default() }
     }
 
     pub fn set_time(&mut self, ms: u64) {
@@ -665,15 +666,20 @@ impl Nat {
                 Ok(sock) => {
                     let our_seq: u32 = (self.now_ms as u32).wrapping_mul(0x9e37_79b9).wrapping_add(self.forwards[fi].guest_port as u32);
                     let guest_port = self.forwards[fi].guest_port;
-                    let host_port = self.forwards[fi].host_port;
+                    // Use a unique source port for each inbound connection so
+                    // the guest's lwIP sees a fresh 4-tuple. Without this, a
+                    // TIME_WAIT PCB from the previous connection swallows the
+                    // new SYN (same 4-tuple -> matched to the old PCB).
+                    let src_port = self.next_inbound_port;
+                    self.next_inbound_port = if self.next_inbound_port >= 60000 { 50000 } else { self.next_inbound_port + 1 };
                     if crate::net::trace_on() {
-                        eprintln!("nat: inbound accept on host:{} -> guest:{}", host_port, guest_port);
+                        eprintln!("nat: inbound accept on host:{} -> guest:{} (src:{})", self.forwards[fi].host_port, guest_port, src_port);
                     }
                     self.tcp.push(TcpConn {
                         guest_ip: STA_IP,
                         guest_port,
                         host_ip: GW_IP,
-                        host_port,
+                        host_port: src_port,
                         sock,
                         state: TcpState::InboundSynSent,
                         guest_seq: 0,
