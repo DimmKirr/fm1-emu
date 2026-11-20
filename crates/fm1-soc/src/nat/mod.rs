@@ -359,6 +359,13 @@ impl Nat {
             self.tcp[i].state = TcpState::Connected;
         }
 
+        let guest_win = if tcp.len() >= 16 { be16(&tcp[14..16]) } else { 0 };
+        if crate::net::trace_on() {
+            eprintln!("nat tcp_in: port={} seq={} ack={} flags={:#04x} data={} guest_win={} tx={} guest_seq={}",
+                self.tcp[i].guest_port, seq, ack, flags, data.len(), guest_win,
+                self.tcp[i].tx.len(), self.tcp[i].guest_seq);
+        }
+
         // the segment against the byte we expect next: a retransmit repeats bytes we have
         // (skipped), a segment past a hole is dropped for a duplicate ACK
         let behind = self.tcp[i].guest_seq.wrapping_sub(seq) as i32;
@@ -427,14 +434,21 @@ impl Nat {
         }
     }
 
-    fn tcp_new(&mut self, guest_ip: [u8; 4], guest_port: u16, host_ip: [u8; 4], host_port: u16, seq: u32, to: &HostAddr) -> Vec<Vec<u8>> {
-        if self.tcp.len() >= MAX_TCP {
-            // evict oldest closed/timewait
-            if let Some(i) = self.tcp.iter().position(|c| matches!(c.state, TcpState::Closed | TcpState::TimeWait(_))) {
+    /// Room in a full table: the oldest finished entry (Closed, or TimeWait: both sides are
+    /// done with it) goes. false when every entry is still in use.
+    fn evict_finished_tcp(&mut self) -> bool {
+        match self.tcp.iter().position(|c| matches!(c.state, TcpState::Closed | TcpState::TimeWait(_))) {
+            Some(i) => {
                 self.tcp.remove(i);
-            } else {
-                return vec![];
+                true
             }
+            None => false,
+        }
+    }
+
+    fn tcp_new(&mut self, guest_ip: [u8; 4], guest_port: u16, host_ip: [u8; 4], host_port: u16, seq: u32, to: &HostAddr) -> Vec<Vec<u8>> {
+        if self.tcp.len() >= MAX_TCP && !self.evict_finished_tcp() {
+            return vec![];
         }
 
         let sock = match self.net.tcp_connect(to, host_port) {
@@ -547,6 +561,10 @@ impl Nat {
 
     fn tcp_ack(&self, idx: usize) -> Vec<Vec<u8>> {
         let c = &self.tcp[idx];
+        let window = TX_CAP.saturating_sub(c.tx.len()).min(TCP_WINDOW as usize) as u16;
+        if crate::net::trace_on() {
+            eprintln!("nat tcp_ack: port={} ack_seq={} window={} tx_buf={}", c.guest_port, c.guest_seq, window, c.tx.len());
+        }
         let tcp = self.tcp_header(idx, 0x10, c.our_seq, c.guest_seq); // ACK
         vec![self.ip_tcp_frame(c.host_ip, c.guest_ip, &tcp)]
     }
@@ -659,7 +677,10 @@ impl Nat {
 
         // accept inbound connections from port-forward listeners
         for fi in 0..self.forwards.len() {
-            if self.tcp.len() >= MAX_TCP {
+            // a full table makes room as an outbound connect does: without it, each finished
+            // request held its entry for TIME_WAIT_MS and a port forward took at most MAX_TCP
+            // requests per TIME_WAIT_MS, however few were open at once
+            if self.tcp.len() >= MAX_TCP && !self.evict_finished_tcp() {
                 break;
             }
             match self.forwards[fi].listener.accept() {
@@ -701,9 +722,17 @@ impl Nat {
         for i in 0..self.tcp.len() {
             match self.tcp[i].state {
                 TcpState::Connected | TcpState::CloseWait => {
+                    let tx_before = self.tcp[i].tx.len();
                     self.drain_tx(i);
                     if self.tcp[i].state == TcpState::Closed {
                         continue;
+                    }
+                    // Window update: if draining freed space and the previous
+                    // window was small, send an ACK so the guest's lwIP can
+                    // resume sending without waiting for the persist timer.
+                    let tx_after = self.tcp[i].tx.len();
+                    if tx_after < tx_before && TX_CAP.saturating_sub(tx_before) < TCP_MSS {
+                        frames.extend(self.tcp_ack(i));
                     }
                     match self.tcp[i].sock.read(&mut buf) {
                         Ok(0) => {
@@ -1312,14 +1341,15 @@ mod tests {
         let isn = seq_of(&out[0]);
         // the SYN is from GW_IP:8080 to STA_IP:9222
         let tcp = tcp_of(&out[0]);
-        assert_eq!(be16(&tcp[0..2]), 8080, "src port is the host forward port");
+        let src = be16(&tcp[0..2]);
+        assert!((50000..=60000).contains(&src), "src port {src}: a fresh one per inbound connection");
         assert_eq!(be16(&tcp[2..4]), 9222, "dst port is the guest port");
         assert_eq!(&out[0][26..30], &GW_IP, "src IP is gateway");
         assert_eq!(&out[0][30..34], &STA_IP, "dst IP is station");
 
         // the guest responds with SYN-ACK
         let guest_isn = 5000u32;
-        let out = send_inbound_tcp(&mut nat, &inbound_tcp(9222, 8080, guest_isn, isn.wrapping_add(1), SYN | ACK, &[]));
+        let out = send_inbound_tcp(&mut nat, &inbound_tcp(9222, src, guest_isn, isn.wrapping_add(1), SYN | ACK, &[]));
         assert_eq!(out.len(), 1, "our ACK");
         assert_eq!(flags_of(&out[0]), ACK);
         assert_eq!(ack_of(&out[0]), guest_isn.wrapping_add(1));
@@ -1348,8 +1378,9 @@ mod tests {
         // complete the handshake
         let syn_frames = nat.poll();
         let isn = seq_of(&syn_frames[0]);
+        let src = be16(&tcp_of(&syn_frames[0])[0..2]);
         let guest_isn = 5000u32;
-        send_inbound_tcp(&mut nat, &inbound_tcp(9222, 8080, guest_isn, isn.wrapping_add(1), SYN | ACK, &[]));
+        send_inbound_tcp(&mut nat, &inbound_tcp(9222, src, guest_isn, isn.wrapping_add(1), SYN | ACK, &[]));
 
         // host -> guest: push data into the mock socket
         inbound_sock.lock().unwrap().rx.extend(b"HTTP/1.1 200 OK\r\n");
@@ -1358,8 +1389,66 @@ mod tests {
         assert_eq!(payload_of(&out[0]), b"HTTP/1.1 200 OK\r\n");
 
         // guest -> host: the guest sends data back
-        let out = send_inbound_tcp(&mut nat, &inbound_tcp(9222, 8080, guest_isn.wrapping_add(1), isn.wrapping_add(18), PSH | ACK, b"GET / HTTP/1.1\r\n"));
+        let out = send_inbound_tcp(&mut nat, &inbound_tcp(9222, src, guest_isn.wrapping_add(1), isn.wrapping_add(18), PSH | ACK, b"GET / HTTP/1.1\r\n"));
         assert_eq!(flags_of(&out[0]), ACK);
         assert_eq!(inbound_sock.lock().unwrap().tx, b"GET / HTTP/1.1\r\n");
+    }
+
+    fn pending_inbound(state: &std::sync::Arc<std::sync::Mutex<mock::MockState>>) -> std::sync::Arc<std::sync::Mutex<mock::MockSock>> {
+        let sock = std::sync::Arc::new(std::sync::Mutex::new(mock::MockSock {
+            to: (HostAddr::Ip(GW_IP), 8080),
+            state: ConnectState::Ready,
+            rx: VecDeque::new(),
+            eof: false,
+            tx: Vec::new(),
+            accept_limit: None,
+            shutdown: false,
+            read_error: None,
+            write_error: None,
+        }));
+        state.lock().unwrap().listeners[0].1.lock().unwrap().pending.push_back(sock.clone());
+        sock
+    }
+
+    #[test]
+    fn inbound_accept_reuses_a_finished_entry_when_the_table_is_full() {
+        // sequential requests: each finished one sits in TimeWait; the next must still get in
+        let (net, state) = MockNet::new();
+        let mut nat = Nat::with_backend(Box::new(net));
+        nat.add_port_forward(8080, 9222).unwrap();
+        for _ in 0..MAX_TCP {
+            pending_inbound(&state);
+            assert_eq!(nat.poll().len(), 1, "a SYN to the guest");
+        }
+        assert_eq!(nat.tcp_count(), MAX_TCP);
+        for c in nat.tcp.iter_mut() {
+            c.state = TcpState::TimeWait(nat.now_ms);
+        }
+        let first_port = nat.tcp[0].host_port;
+        pending_inbound(&state);
+        let out = nat.poll();
+        assert_eq!(out.len(), 1, "request {} is accepted", MAX_TCP + 1);
+        assert_eq!(flags_of(&out[0]), SYN);
+        assert_eq!(nat.tcp_count(), MAX_TCP, "the oldest finished entry made room");
+        assert!(nat.tcp.iter().all(|c| c.host_port != first_port), "the oldest one went");
+        assert!(matches!(nat.tcp[MAX_TCP - 1].state, TcpState::InboundSynSent));
+    }
+
+    #[test]
+    fn inbound_accept_waits_while_every_entry_is_live() {
+        let (net, state) = MockNet::new();
+        let mut nat = Nat::with_backend(Box::new(net));
+        nat.add_port_forward(8080, 9222).unwrap();
+        for _ in 0..MAX_TCP {
+            pending_inbound(&state);
+            nat.poll();
+        }
+        for c in nat.tcp.iter_mut() {
+            c.state = TcpState::Connected;
+        }
+        pending_inbound(&state);
+        assert!(nat.poll().is_empty(), "no room: the connection waits in the listener");
+        assert_eq!(nat.tcp_count(), MAX_TCP);
+        assert_eq!(state.lock().unwrap().listeners[0].1.lock().unwrap().pending.len(), 1, "still pending");
     }
 }
