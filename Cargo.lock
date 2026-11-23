@@ -635,13 +635,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fm1-gdbstub"
-version = "100.3.2"
-dependencies = [
- "fm1-core",
-]
-
-[[package]]
 name = "fm1-isa"
 version = "100.3.2"
 
@@ -651,6 +644,7 @@ version = "100.3.2"
 dependencies = [
  "cpal",
  "fm1-core",
+ "fm1-map",
  "fm1-soc",
  "libm",
  "midir",
@@ -659,6 +653,14 @@ dependencies = [
  "serde_json",
  "tungstenite",
  "wasapi",
+]
+
+[[package]]
+name = "fm1-map"
+version = "100.3.2"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

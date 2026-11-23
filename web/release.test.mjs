@@ -60,6 +60,15 @@ test('the downloads: plugin macOS, Windows; fm1-live Windows, macOS, Linux x86-6
     'fm1-emu linux-x86_64', 'fm1-emu linux-arm64']);
 });
 
+test('one Mac download for Apple silicon and Intel', () => {
+  const md = 'Lead.\n\n## Downloads\n\n| File | What it is |\n|---|---|\n| `fm1-plugin-9.9.9-macos-universal.zip` | The plugin |\n\n' +
+    '## What\'s new\n\n- **One**: a thing.\n';
+  const r = parseNotes(md, '9.9.9');
+  assert.deepEqual(r.downloads.map((d) => `${d.os} ${d.arch}`), ['macos universal']);
+  const html = render({ version: '9.9.9', tag: 'v9.9.9', url: 'u', notesPath: 'n', ...r }).section;
+  assert.match(html, /<span>macOS<\/span><small>Apple silicon and Intel<\/small>/);
+});
+
 test('the film shows once the notes link it, and not before', () => {
   const md = read('docs/releases/v0.5.1.md');
   const base = { version: '0.5.1', tag: 'v0.5.1', url: 'u', notesPath: 'docs/releases/v0.5.1.md' };
@@ -89,6 +98,7 @@ test('the pages carry the release blocks, and a rerun changes nothing', () => {
   assert.match(index, /<!-- release:pill -->[\s\S]*<!-- \/release:pill -->/);
   assert.match(index, /<section id="release"[^>]*><!-- release:section -->[\s\S]*<!-- \/release:section --><\/section>/);
   assert.match(read('web/smk37/index.html'), /<!-- release:pill -->[\s\S]*<!-- \/release:pill -->/);
+  assert.match(read('web/dev/index.html'), /<!-- release:pill -->[\s\S]*<!-- \/release:pill -->/);
   const once = apply(index, blocks);
   assert.equal(apply(once, blocks), once);
   assert.throws(() => apply('<p>no blocks</p>', blocks), /no <!-- release/);
